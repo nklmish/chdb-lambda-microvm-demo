@@ -1,0 +1,7 @@
+# evaluation/requirements.txt — Evaluation-only deps (autoevals, openai)
+# Versions pinned to match requirements-dev.txt
+# to avoid drift between local eval smoke and CI runs.
+autoevals>=0.0.20
+openai>=1.0.0
+# boto3 is already in base requirements.txt (for evaluation/invoke.py → AgentCore)
+# langfuse is already in base requirements.txt (for trace-context handoff)

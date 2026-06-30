@@ -1,0 +1,260 @@
+# NYC Taxi Analytics Agent
+
+A streaming, natural-language analytics agent over NYC Yellow Taxi data that **carries its
+own query engine**. Instead of reaching across a network to a warehouse on every step, the
+agent embeds [chDB](https://github.com/chdb-io/chdb) (in-process ClickHouse) and thinks
+*with* its data — local memory, cross-source federation, and sub-millisecond recall, all
+inside the agent's own process.
+
+It is a reference implementation of the idea that **the data layer should travel with the
+agent**, and a worked example of running that pattern on
+[AWS Lambda MicroVMs](https://aws.amazon.com/lambda/lambda-microvms/) — where every MicroVM
+carries its own private, snapshot-hot chDB engine, billed only while it runs. chDB is a
+launch partner for Lambda MicroVMs; this repo shows why the two fit together.
+
+> **TL;DR** — ask questions like *"do rainy days have more trips?"* and the agent answers
+> with one ClickHouse SQL statement run in-process against a baked local store, reaching out
+> to remote sources (AWS S3, PostgreSQL, ClickHouse Cloud) only when a question needs them —
+> no connection pools, no warehouse to overload.
+
+---
+
+## Why in-process data
+
+An agent is a loop: plan → call a tool → read the result → reason → repeat, often 5–20 tool
+calls per turn, and most of those calls are data access. When that data lives across a
+network, two things happen:
+
+- **Latency compounds.** Ten sequential round-trips of dead air are felt as "the agent is slow."
+- **Instability becomes a token cost.** A flaky call triggers a retry — and in an agent loop a
+  retry re-sends the whole context window, then a detour. The cost shows up on the bill.
+
+chDB attacks both at the root by putting a full ClickHouse query engine *inside the agent's
+process*. This project demonstrates that across three pillars:
+
+1. **Local agent memory** — append-only, time-travelling memory in chDB (`chdb_memory.py`).
+2. **A federation hub** — chDB can join the local store with remote sources (AWS S3,
+   PostgreSQL, ClickHouse Cloud) in a single declarative SQL statement (`federation_tools.py`).
+3. **Stability & cost** — the hot path is a function call, not a network request, so it is
+   fast and deterministic.
+
+On **Lambda MicroVMs** all three land in the cloud at once: a Firecracker-isolated VM with a
+private chDB, hot from the first millisecond (memory snapshot), suspended when idle (no
+charge), and resumed with state intact.
+
+## What it can answer
+
+| Question | Tool | Data path |
+|---|---|---|
+| "Average fare in Manhattan?" / "Busiest hour?" | `analyze_taxi_data` | baked local chDB store |
+| "How many trips in a month past the baked data?" | `query_with_fresh_data` | baked store + live CDN delta (when the public TLC CDN serves that month) |
+| "Do rainy days have more trips than clear days?" | `analyze_weather_impact` | NOAA GSOD (S3 Files mount or `s3()`) |
+| "How has tipping changed over the decade?" | `analyze_fleet_across_clouds` | one SQL spanning the local store + remote sources |
+| "Which pickup zones tip best?" | `analyze_zone_tipping` | local chDB JOIN a PostgreSQL zone lookup |
+
+The federation tool reads from remote sources, then **materializes the result into the local
+chDB store** so the next identical question is served in milliseconds — *federate to reach,
+localize to think*. Sources are an allow-list vetted in
+[`cloud_sources.py`](cloud_sources.py); the model never supplies a URL or a credential.
+
+> Note: `query_with_fresh_data` and the live-delta path depend on the public NYC TLC
+> CloudFront CDN. The agent reads it with a browser User-Agent to avoid WAF throttling, but
+> the CDN can still return `403`/`404` for some months; the tool degrades gracefully and
+> reports the month as unavailable rather than failing. Questions inside the baked data range
+> are always served locally.
+
+## Architecture
+
+```
+Browser ──HTTP/SSE──▶ FastAPI (main.py) ──▶ Strands Agent (agent.py) ──▶ Amazon Bedrock
+                          │                      │                        (Claude Sonnet 4)
+                          │                      ├─▶ analyze_taxi_data         ──▶ chDB embedded store
+                          │                      ├─▶ query_with_fresh_data     ──▶ chDB + CDN delta
+                          │                      ├─▶ analyze_weather_impact    ──▶ NOAA GSOD (mount / s3())
+                          │                      ├─▶ analyze_fleet_across_clouds ─▶ chDB federation:
+                          │                      │        local store + remote (S3 · ClickHouse Cloud)
+                          │                      └─▶ analyze_zone_tipping      ──▶ chDB JOIN postgresql()
+                          ├─▶ AgentCore Memory (optional)   ─ cross-session memory
+                          └─▶ Langfuse / OTEL  (optional)   ─ traces, token & cost metrics
+```
+
+The same application targets three environments (Local and Lambda MicroVMs are the
+actively validated paths; AgentCore Runtime is also supported via the deploy script + CDK):
+
+| Target | How | Notes |
+|---|---|---|
+| **Local** | `uvicorn main:app` | embedded chDB; fastest dev loop |
+| **AWS Lambda MicroVMs** | `microvm_entrypoint.py` + `Dockerfile.microvm` | snapshot-hot chDB, suspend/resume, public egress (no VPC/NAT) |
+| **AWS Bedrock AgentCore Runtime** | `scripts/create_runtime.py` + CDK | also supported — managed Firecracker runtime + AgentCore Memory (heavier: VPC/NAT/CDK) |
+
+## Running on AWS Lambda MicroVMs
+
+Lambda MicroVMs fuse Firecracker isolation, snapshot-based fast starts, and suspend/resume
+with state preserved. This app exploits all three via the **lifecycle-hook contract**: the
+hooks server ([`microvm_hooks.py`](microvm_hooks.py)) runs alongside the app
+([`microvm_entrypoint.py`](microvm_entrypoint.py)) in one process so that `/ready` warms the
+chDB store *before* the platform snapshots the VM — the first query is then served hot, with
+no engine init and no store load. Egress is public by default, so there is **no VPC and no
+NAT gateway** to provision.
+
+```bash
+# Requires AWS CLI >= 2.35.12 (the version that ships the `lambda-microvms` service)
+python scripts/deploy_microvm.py --dry-run          # print every AWS call, change nothing
+python scripts/deploy_microvm.py --region us-west-2  # build the image, run a MicroVM, verify
+python scripts/deploy_microvm.py --terminate-only    # tear down
+```
+
+The deploy is account-agnostic and idempotent: it derives every resource from the caller
+identity, creates a private S3 artifact bucket and two least-privilege IAM roles, packages
+the app (a secret guard refuses to ship any `.env*` except `.env.example`), builds the
+MicroVM image with lifecycle hooks, runs a MicroVM, and verifies `/ping → /health → /chat`
+over the dedicated HTTPS endpoint.
+
+## Demos
+
+Each demo backs a specific claim. The first set needs only `pip install`; the rest need AWS
+(and, for graduation, a ClickHouse Cloud service).
+
+**Local, no cloud:**
+
+```bash
+# Snapshot-boot + suspend/resume fidelity, with the real lifecycle hooks and chDB,
+# emulated by killing and restarting the process on a persistent store:
+python scripts/microvm_local_lifecycle.py --synthetic
+
+# chDB-native agent memory: remember -> recall -> revise as history, plus a
+# point-in-time "what did the agent believe before I corrected it?" query:
+python scripts/chdb_memory_demo.py
+```
+
+**On AWS:**
+
+- **Snapshot-hot start** — the first analytical query after `RunMicrovm` is warm because
+  `/ready` gated the snapshot on chDB being loaded (`scripts/deploy_microvm.py` verify step).
+- **The agent brain that suspends and resumes** — federate a decade of tipping (materialized
+  into the local chDB store), `suspend-microvm` (no charge), then `resume-microvm` and get the
+  same answer from the on-disk cache in milliseconds.
+- **Fleet fan-out** — N MicroVMs, each with its own private chDB, answering the same question
+  concurrently (no shared database to overload):
+  ```bash
+  python scripts/microvm_fleet_demo.py --count 5 --region us-west-2
+  ```
+- **Zero-refactor graduation to ClickHouse Cloud** — the *same* analytical SQL served from a
+  local chDB table, then from ClickHouse Cloud via `remoteSecure()` — only the view's source
+  changes:
+  ```bash
+  python scripts/graduation_demo.py --db-path ./local_chdb_data
+  ```
+
+## Quick start (local)
+
+Prerequisites: **Python 3.13**, AWS credentials with **Amazon Bedrock** access to the Claude
+Sonnet 4 inference profile (`us.anthropic.claude-sonnet-4-20250514-v1:0`).
+
+```bash
+git clone <your-fork-url> nyc-taxi-agent && cd nyc-taxi-agent
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+cp .env.example .env.local          # fill in AWS creds / region
+
+# Bake a one-month sample (~3M rows, a few seconds) so the agent has data to query.
+python scripts/bake_sample.py                       # writes ./local_chdb_data + data_profile.json
+
+# Run the app.
+CHDB_DATA_PATH="$PWD/local_chdb_data" uvicorn main:app --host 127.0.0.1 --port 8080
+```
+
+Then drive it:
+
+```bash
+curl -s localhost:8080/health     # {"status":"healthy","row_count":2964624}
+curl -s localhost:8080/chat -H 'Content-Type: application/json' \
+  -d '{"text":"What is the busiest hour of the day? One sentence."}'
+```
+
+The FastAPI app warms chDB at startup, so the first query is served from a loaded store. A
+single-file chat UI is served at `http://localhost:8080/`. (Skip the bake and the app starts
+fine but `/health` reports `unhealthy` and `/chat` errors until data exists.)
+
+## Claude Code skills
+
+This repo ships **project skills** under [`.claude/skills/`](.claude/skills/) — validated,
+end-to-end workflows that [Claude Code](https://claude.com/claude-code) auto-discovers. They
+are optional conveniences; everything they do can also be run by hand.
+
+| Skill | What it does |
+|---|---|
+| `run-local` | Bake a one-month sample and run the app locally for a fast smoke test |
+| `run-prod` | Run locally in prod mode with AgentCore Memory provisioned in your account |
+| `deploy-microvm` | Package and deploy to **AWS Lambda MicroVMs**, then verify over the endpoint |
+| `deploy-agentcore` | Provision CDK infra + AgentCore Memory and register an AgentCore Runtime |
+| `deploy-to-prod` | Full AWS deploy plus a local browser UI wired to the deployed runtime |
+| `deploy-mount-demo` | EC2 host that NFS-mounts an S3 Files filesystem for the weather `file()` path |
+
+## Configuration
+
+All configuration is via environment variables (see [`.env.example`](.env.example)). Secrets
+belong in `.env.local` (git-ignored) or AWS SSM — never commit them.
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` | yes | AWS auth for Bedrock (+ optional Memory/S3) |
+| `AWS_REGION` | yes | Region for AWS clients |
+| `BEDROCK_MODEL_ID` | no (default set) | Bedrock model / inference profile |
+| `BEDROCK_REGION` | no | Overrides the Bedrock client region (used on MicroVMs, where `AWS_REGION` is reserved) |
+| `CHDB_DATA_PATH` | yes | Path to the baked chDB store |
+| `MICROVM_HOOKS_PORT` | no (9000) | Lifecycle-hook port (Lambda MicroVMs) |
+| `WEATHER_MOUNT_PATH` | no | S3 Files NFS mount path; falls back to direct `s3()` if absent |
+| `CLICKHOUSE_URL` / `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` | no | ClickHouse Cloud federation leg (skipped if unset) |
+| `POSTGRES_*` | no | PostgreSQL zone-lookup leg for `analyze_zone_tipping` |
+| `AGENTCORE_MEMORY_ID` | no | Cross-session AgentCore Memory; agent is stateless without it |
+| `LANGFUSE_*` / `OTEL_EXPORTER_OTLP_*` | no | Observability; trace export is disabled when no endpoint is configured |
+| `IS_PROD` | no (false) | Toggles prod-only code paths |
+
+## Testing
+
+```bash
+pytest -q                 # unit + integration (chDB-backed) tests
+pytest -m unit            # fast, isolated unit tests only
+pytest -m network         # opt-in tests that reach external clouds
+```
+
+Unit and integration tests run from a clean clone with just `pip install`. The cloud demos
+(`deploy_microvm.py`, `microvm_fleet_demo.py`, `graduation_demo.py`) require live AWS
+credentials and are not part of the offline suite.
+
+## Repository layout
+
+```
+main.py                      FastAPI app: /chat, /chat/stream, /health, /ping, /invocations
+agent.py                     Strands agent wiring + streaming
+chdb_tools.py                analyze_taxi_data          (baked store)
+sql_tools.py                 query_with_fresh_data      (baked + CDN delta)
+weather_tools.py             analyze_weather_impact     (NOAA GSOD)
+federation_tools.py          analyze_fleet_across_clouds + analyze_zone_tipping
+cloud_sources.py             vetted federation source allow-list
+chdb_memory.py               append-only chDB agent memory with time-travel
+db.py / init_db.py           chDB accessors + build-time data bake
+memory.py / agent_memory.py  session + cross-session (AgentCore) memory
+observability.py             Langfuse / OTEL setup
+microvm_hooks.py             reusable Lambda MicroVMs lifecycle-hook server
+microvm_runtime.py           taxi-app warm/validate/checkpoint wiring
+microvm_entrypoint.py        runs the app (:8080) + hooks (:9000) in one process
+Dockerfile / Dockerfile.microvm   container images (AgentCore / MicroVMs)
+scripts/                     deploy + demo scripts (see Demos)
+cdk/                         AWS CDK stacks (VPC, IAM, ECR, S3 Files, monitoring, CI/CD)
+cicd/ · evaluation/          CI factuality gate + evaluation harness
+static/index.html            single-file chat UI
+tests/                       unit + integration tests
+.claude/skills/              Claude Code project skills
+```
+
+## Tech stack
+
+Amazon Bedrock (Claude Sonnet 4) · [Strands Agents](https://github.com/strands-agents/sdk-python) ·
+[chDB](https://github.com/chdb-io/chdb) 4.1.8 · FastAPI + uvicorn · AWS Lambda MicroVMs /
+Bedrock AgentCore · AWS CDK · Langfuse (OTEL) · ClickHouse Cloud.
+
+## License
+
+Licensed under the Apache License, Version 2.0 — see [LICENSE](LICENSE).

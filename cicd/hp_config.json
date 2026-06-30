@@ -1,0 +1,9 @@
+{
+  "tst": {
+    "agent_arn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/nyc_taxi_agent_TST-MtLcIJCZgG",
+    "agent_name": "nyc_taxi_agent_TST",
+    "agent_id": "nyc_taxi_agent_TST-MtLcIJCZgG",
+    "environment": "TST"
+  },
+  "prd": null
+}

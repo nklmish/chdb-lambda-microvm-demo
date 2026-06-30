@@ -1,0 +1,36 @@
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.env
+.env.*
+!.env.example
+local_chdb_data/
+chdb_data/
+# Host-baked store. The normal Dockerfile bakes data IN-CONTAINER into
+# local_chdb_data, then runs `COPY . .` — without this ignore the ~940MB host
+# bake would be copied in on top of the in-container bake, ~doubling the image
+# and busting the 2048MB AgentCore Runtime cap. NOTE: the FALLBACK build
+# (Dockerfile.prebaked) needs this dir IN the context — comment this line out
+# before building with Dockerfile.prebaked.
+full_chdb_data/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+node_modules/
+.venv/
+.kiro/
+.agent/
+cdk/
+cdk/cdk.out/
+agentcore/cdk/
+refactor-docs/
+tests/
+evaluation/
+cicd/
+.github/
+scripts/
+*.md
+!requirements*.txt
+factuality_results.json

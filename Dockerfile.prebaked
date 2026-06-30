@@ -1,0 +1,44 @@
+# Dockerfile.prebaked — build the runtime image from a HOST-baked chDB store.
+#
+# Use this when the in-container CDN bake (the normal Dockerfile) is being
+# rate-limited by CloudFront after repeated full downloads. Bake on the host
+# first (host egress isn't throttled), then build with this — no CDN access
+# happens during the build at all:
+#
+#   CHDB_DATA_PATH="$PWD/full_chdb_data" DATA_MODE=full \
+#     BAKE_START_YEAR=2024 BAKE_END_YEAR=2025 python init_db.py
+#   finch build -f Dockerfile.prebaked -t nyc-taxi-agent:full-data .
+#
+# Expects ./full_chdb_data (the baked store) and ./data_profile.json in context.
+# Uses explicit COPYs (not `COPY . .`) so the large baked store lands in ONE
+# layer at its final path — avoids doubling the 1.4GB+ store across layers.
+
+# Stage 1: deps only (from the pinned lock — no resolution-too-deep, no bake)
+FROM python:3.13-slim AS builder
+WORKDIR /app
+COPY requirements.txt requirements.lock ./
+RUN pip install --no-cache-dir -r requirements.lock
+
+# Stage 2: runtime
+FROM python:3.13-slim
+WORKDIR /app
+# Create the runtime user FIRST so we can set ownership at COPY time with --chown.
+# A trailing `chown -R appuser /app` would copy-up the ~0.9GB baked store into a
+# second overlay layer, ~doubling the image (busting the 2048MB AgentCore cap).
+RUN useradd -m -u 1000 appuser
+COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+# App code (datastore is a pip package, already installed above)
+COPY *.py ./
+COPY static ./static
+COPY utils ./utils
+COPY agentcore ./agentcore
+COPY data_profile.json ./
+# Host-baked chDB store → final path the app reads (CHDB_DATA_PATH). Single layer,
+# owned by appuser at copy time (no chown copy-up).
+COPY --chown=appuser:appuser full_chdb_data /app/local_chdb_data
+ENV PYTHONUNBUFFERED=1
+USER appuser
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"
+CMD ["opentelemetry-instrument", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]

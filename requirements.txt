@@ -1,0 +1,17 @@
+strands-agents[otel]>=1.35.0
+chdb>=4.1.8
+fastapi>=0.135.0
+uvicorn>=0.44.0
+pydantic>=2.13.0
+boto3>=1.42.0
+slowapi>=0.1.9
+langfuse>=4.3.1
+bedrock-agentcore>=1.6.1
+requests>=2.28
+sse-starlette>=2.0
+aws-opentelemetry-distro>=0.10.0
+# aws-opentelemetry-distro pins opentelemetry-instrumentation-botocore==0.61b0
+# exactly (true through the current latest 0.17.1), so this floor MUST stay at
+# 0.61b0. An earlier >=0.62b0 floor was unsatisfiable against that exact pin and
+# was the cause of pip "resolution-too-deep" when resolving this file.
+opentelemetry-instrumentation-botocore>=0.61b0

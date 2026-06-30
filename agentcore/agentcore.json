@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.agentcore.aws.dev/v1/agentcore.json",
+  "name": "nyctaxiagent",
+  "version": 1,
+  "managedBy": "CDK",
+  "tags": {
+    "agentcore:created-by": "agentcore-cli",
+    "agentcore:project-name": "nyctaxiagent"
+  },
+  "runtimes": [
+    {
+      "name": "nyc_taxi_agent",
+      "build": "Container",
+      "entrypoint": "main.py",
+      "codeLocation": "./",
+      "runtimeVersion": "PYTHON_3_13",
+      "networkMode": "VPC",
+      "protocol": "HTTP",
+      "authorizerType": "AWS_IAM",
+      "instrumentation": {
+        "enableOtel": false
+      },
+      "envVars": [
+        { "name": "BEDROCK_MODEL_ID", "value": "us.anthropic.claude-sonnet-4-20250514-v1:0" },
+        { "name": "AWS_REGION", "value": "us-east-1" },
+        { "name": "CHDB_DATA_PATH", "value": "/app/local_chdb_data" },
+        { "name": "WEATHER_MOUNT_PATH", "value": "/mnt/noaa-gsod" },
+        { "name": "IS_PROD", "value": "true" },
+        { "name": "LANGFUSE_TRACING_ENVIRONMENT", "value": "PRD" },
+        { "name": "DISABLE_ADOT_OBSERVABILITY", "value": "true" }
+      ]
+    }
+  ],
+  "memories": [],
+  "credentials": [],
+  "evaluators": [],
+  "onlineEvalConfigs": [],
+  "agentCoreGateways": []
+}

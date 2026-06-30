@@ -1,0 +1,83 @@
+{
+  "mcpServers": {
+    "bedrock-agentcore-mcp-server": {
+      "command": "uvx",
+      "args": [
+        "awslabs.amazon-bedrock-agentcore-mcp-server@latest"
+      ],
+      "env": {
+        "FASTMCP_LOG_LEVEL": "ERROR"
+      },
+      "disabled": false,
+      "autoApprove": [
+        "search_agentcore_docs",
+        "fetch_agentcore_doc"
+      ]
+    },
+    "aws.dp-mcp": {
+      "command": "uvx",
+      "args": [
+        "awslabs.aws-dataprocessing-mcp-server@latest",
+        "--allow-write"
+      ],
+      "env": {
+        "FASTMCP_LOG_LEVEL": "ERROR",
+        "AWS_REGION": "us-east-1"
+      }
+    },
+    "awslabs.aws-api-mcp-server": {
+      "command": "uvx",
+      "args": [
+        "awslabs.aws-api-mcp-server@latest"
+      ],
+      "env": {
+      },
+      "disabled": false,
+      "autoApprove": []
+    },
+    "awslabs.aws-iac-mcp-server": {
+      "command": "uvx",
+      "args": ["awslabs.aws-iac-mcp-server@latest"],
+      "env": {
+      "FASTMCP_LOG_LEVEL": "ERROR"
+      },
+      "disabled": false,
+      "autoApprove": []
+    },
+    "awslabs.aws-documentation-mcp-server": {
+      "command": "uvx",
+      "args": ["awslabs.aws-documentation-mcp-server@latest"],
+      "env": {
+        "FASTMCP_LOG_LEVEL": "ERROR",
+        "AWS_DOCUMENTATION_PARTITION": "aws",
+        "MCP_USER_AGENT": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+      },
+      "disabled": false,
+      "autoApprove": []
+    },
+    "aws-knowledge-mcp-server": {
+      "url": "https://knowledge-mcp.global.api.aws",
+      "type": "http",
+      "disabled": false
+    },
+    "awslabs.aws-serverless-mcp-server": {
+        "command": "uvx",
+        "args": ["awslabs.aws-serverless-mcp-server@latest"],
+        "env": {
+        },
+        "disabled": false,
+        "autoApprove": []
+    },
+    "awslabs.stepfunctions-tool-mcp-server": {
+      "command": "uvx",
+      "args": ["awslabs.stepfunctions-tool-mcp-server@latest"],
+      "env": {
+        "STATE_MACHINE_PREFIX": "your-state-machine-prefix",
+        "STATE_MACHINE_LIST": "your-first-state-machine, your-second-state-machine",
+        "STATE_MACHINE_TAG_KEY": "your-tag-key",
+        "STATE_MACHINE_TAG_VALUE": "your-tag-value",
+        "STATE_MACHINE_INPUT_SCHEMA_ARN_TAG_KEY": "your-state-machine-tag-for-input-schema"
+      }
+    }    
+  }
+}

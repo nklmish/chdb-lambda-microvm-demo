@@ -1,0 +1,18 @@
+{
+  "description": "HPO variant matrix skeleton (Phase 1). Consumed by evaluation/hpo.py. Expand with additional variants as needed; each combination spawns one agent deployment + Langfuse experiment run.",
+  "variants": {
+    "model_id": [
+      "us.anthropic.claude-sonnet-4-20250514-v1:0"
+    ],
+    "temperature": [
+      0.0,
+      0.2
+    ],
+    "system_prompt_variant": [
+      "baseline",
+      "concise"
+    ]
+  },
+  "dataset_name": "nyc-taxi-agent-evaluation",
+  "notes": " scaffold — full HPO execution (deploy N variants, run Langfuse experiments, cleanup) deferred to a future milestone. Expand variants list then wire variant-apply logic in hpo.py."
+}

@@ -1,0 +1,42 @@
+{
+  "name": "nyc-taxi-agent-evaluation",
+  "description": "Evaluation dataset for NYC Taxi Analytics Agent",
+  "items": [
+    {
+      "input": {
+        "question": "What was the average fare for trips from LaGuardia in January 2025?"
+      },
+      "expected_output": {
+        "trajectory": ["analyze_taxi_data"],
+        "response_facts": [
+          "The query should filter by pickup_location_id for LaGuardia zone",
+          "The result should include an average fare amount"
+        ]
+      }
+    },
+    {
+      "input": {
+        "question": "How did rain affect taxi ridership in 2024?"
+      },
+      "expected_output": {
+        "trajectory": ["analyze_weather_impact"],
+        "response_facts": [
+          "Should compare trip counts between rainy and clear days",
+          "Should use NOAA weather data from LaGuardia station"
+        ]
+      }
+    },
+    {
+      "input": {
+        "question": "What was the average fare amount for taxi trips in January 2026?"
+      },
+      "expected_output": {
+        "trajectory": ["query_with_fresh_data"],
+        "response_facts": [
+          "Should report an average fare amount for January 2026",
+          "Should use fresh data from the delta layer (post-baked-cutoff)"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+services:
+  agent:
+    build:
+      context: .
+      args:
+        DATA_MODE: sample
+    ports:
+      - "8080:8080"
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - BEDROCK_MODEL_ID=${BEDROCK_MODEL_ID:-us.anthropic.claude-sonnet-4-20250514-v1:0}
+      - IS_PROD=false
+      - LANGFUSE_TRACING_ENVIRONMENT=DEV
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      - OTEL_EXPORTER_OTLP_HEADERS=${OTEL_EXPORTER_OTLP_HEADERS:-}
+      - DISABLE_ADOT_OBSERVABILITY=true
+      # ClickHouse Cloud federation leg (optional — skipped if password unset).
+      - CLICKHOUSE_URL=${CLICKHOUSE_URL:-}
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER:-default}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-}
+      # PostgreSQL zone-lookup leg (in-compose service below).
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=nyctaxi
+      - POSTGRES_USER=taxi
+      - POSTGRES_PASSWORD=taxi
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Third-party RDBMS federation leg — NYC TLC taxi-zone lookup. chDB joins this
+  # via the postgresql() table function (the paper's Fig 3 / hero-SQL leg).
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_DB=nyctaxi
+      - POSTGRES_USER=taxi
+      - POSTGRES_PASSWORD=taxi
+    ports:
+      - "55432:5432"
+    volumes:
+      - ./scripts/postgres_init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taxi -d nyctaxi"]
+      interval: 5s
+      timeout: 3s
+      retries: 10

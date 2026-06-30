@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+
+# chDB data (baked at build time, not committed)
+local_chdb_data/
+chdb_data/
+data_profile.json
+
+# Environment
+.env
+.env.local
+.env.production
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# CDK
+cdk/cdk.out/
+cdk/.venv/
+cdk/cdk.context.json
+agentcore/cdk/cdk.out/
+
+# Build artifacts
+dist/
+build/
+
+# Evaluation outputs
+factuality_results.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Agent scratchpads
+.kiro/drafts/
+full_chdb_data/
+
+# Lambda MicroVMs local scratch
+.microvm_emulator_data/
+.microvm_artifact.zip

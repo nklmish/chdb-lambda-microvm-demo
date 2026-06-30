@@ -1,0 +1,48 @@
+# Dockerfile.microvm — image for AWS Lambda MicroVMs.
+#
+# Differences from the AgentCore/local Dockerfile:
+#   * Base is the public-ECR mirror of the official python:3.13-slim image, so the
+#     MicroVM *build role* can pull it without Docker Hub auth/rate limits. (chDB
+#     requires Python 3.13; the AL2023 managed base ships an older Python, which is
+#     why we keep the proven 3.13 stack rather than rebuild deps on AL2023.)
+#   * Exposes BOTH the application port (8080) and the lifecycle-hooks port (9000).
+#   * Entry point runs microvm_entrypoint.py, which serves the app AND the six
+#     Lambda MicroVMs lifecycle hooks in one process (so /ready warms the same
+#     process the app serves from — the snapshot captures a hot chDB engine).
+#
+# Build context is the repo root. The chDB store is baked at build time, exactly
+# as in the standard Dockerfile, so the snapshot has real data to warm.
+
+# Stage 1: Builder — install deps + bake data
+FROM public.ecr.aws/docker/library/python:3.13-slim AS builder
+WORKDIR /app
+COPY requirements.txt requirements.lock ./
+RUN pip install --no-cache-dir -r requirements.lock
+COPY init_db.py ./
+# NOTE: init_db.py does NOT import db.py — it uses chdb.query() directly.
+ENV CHDB_DATA_PATH=/app/local_chdb_data
+ARG DATA_MODE=sample
+ARG BAKE_START_YEAR=2024
+ARG BAKE_END_YEAR=2025
+RUN python init_db.py
+
+# Stage 2: Runtime — minimal image
+FROM public.ecr.aws/docker/library/python:3.13-slim
+WORKDIR /app
+# Create the runtime user FIRST and COPY --chown (no trailing `chown -R`, which
+# would copy-up the baked store into a second layer and ~double the image).
+RUN useradd -m -u 1000 appuser
+COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+COPY --from=builder --chown=appuser:appuser /app/local_chdb_data /app/local_chdb_data
+COPY --from=builder /app/data_profile.json /app/data_profile.json
+COPY --chown=appuser:appuser . .
+ENV PYTHONUNBUFFERED=1
+ENV MICROVM_HOOKS_PORT=9000
+USER appuser
+# 8080: application traffic (routed by the MicroVM proxy). 9000: lifecycle hooks.
+EXPOSE 8080 9000
+HEALTHCHECK --interval=30s --timeout=5s CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"
+# opentelemetry-instrument wraps the process to keep OTEL auto-instrumentation;
+# microvm_entrypoint.py runs the app (:8080) + hooks (:9000) on one event loop.
+CMD ["opentelemetry-instrument", "python", "microvm_entrypoint.py"]

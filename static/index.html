@@ -1,0 +1,916 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NYC Taxi Agent</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --bg: #f8f9fa;
+            --surface: #ffffff;
+            --user-bubble: #0066cc;
+            --user-text: #ffffff;
+            --agent-bubble: #f0f2f5;
+            --agent-text: #1a1a1a;
+            --border: #e0e0e0;
+            --muted: #6b7280;
+            --accent: #0066cc;
+            --error: #dc2626;
+            --warning: #f59e0b;
+            --radius: 16px;
+        }
+
+        body.dark {
+            --bg: #1a1a2e;
+            --surface: #16213e;
+            --user-bubble: #0066cc;
+            --user-text: #ffffff;
+            --agent-bubble: #1e2a4a;
+            --agent-text: #e0e0e0;
+            --border: #2a2a4a;
+            --muted: #9ca3af;
+            --accent: #4d94ff;
+            --error: #ef4444;
+            --warning: #fbbf24;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--agent-text);
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 800px;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            background: var(--surface);
+            box-shadow: 0 0 40px rgba(0,0,0,0.08);
+        }
+
+        /* ── Header ─────────────────────────────── */
+        .header {
+            padding: 14px 20px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-shrink: 0;
+        }
+
+        .header h1 {
+            font-size: 17px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .header-actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        .header-btn {
+            background: none;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 6px 10px;
+            cursor: pointer;
+            color: var(--muted);
+            font-size: 13px;
+            transition: all 0.15s;
+        }
+
+        .header-btn:hover { border-color: var(--accent); color: var(--accent); }
+        .header-btn:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+        /* ── Messages ───────────────────────────── */
+        .messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            scroll-behavior: smooth;
+        }
+
+        .message {
+            max-width: 75%;
+            padding: 12px 16px;
+            border-radius: var(--radius);
+            line-height: 1.55;
+            font-size: 14.5px;
+            word-wrap: break-word;
+            animation: fadeIn 0.2s ease;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(6px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .message.user {
+            align-self: flex-end;
+            background: var(--user-bubble);
+            color: var(--user-text);
+            border-bottom-right-radius: 4px;
+        }
+
+        .message.agent {
+            align-self: flex-start;
+            background: var(--agent-bubble);
+            color: var(--agent-text);
+            border-bottom-left-radius: 4px;
+        }
+
+        .message.error {
+            align-self: flex-start;
+            background: #fef2f2;
+            color: var(--error);
+            border: 1px solid #fecaca;
+            border-bottom-left-radius: 4px;
+        }
+
+        body.dark .message.error {
+            background: #2d1b1b;
+            border-color: #5c2020;
+        }
+
+        .message.welcome {
+            align-self: center;
+            max-width: 90%;
+            background: var(--agent-bubble);
+            text-align: center;
+            border-radius: var(--radius);
+        }
+
+        .message strong { font-weight: 600; }
+        .message code {
+            background: rgba(0,0,0,0.06);
+            padding: 1px 5px;
+            border-radius: 4px;
+            font-size: 13px;
+            font-family: "SF Mono", Menlo, monospace;
+        }
+
+        body.dark .message code { background: rgba(255,255,255,0.08); }
+
+        /* ── Suggestions ────────────────────────── */
+        .suggestions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            justify-content: center;
+            margin-top: 12px;
+        }
+
+        .suggestion-chip {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            padding: 8px 16px;
+            font-size: 13px;
+            cursor: pointer;
+            color: var(--accent);
+            transition: all 0.15s;
+        }
+
+        .suggestion-chip:hover {
+            background: var(--accent);
+            color: white;
+            border-color: var(--accent);
+        }
+
+        .suggestion-chip:focus {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
+        }
+
+        /* ── Typing indicator ───────────────────── */
+        .typing {
+            align-self: flex-start;
+            padding: 12px 18px;
+            background: var(--agent-bubble);
+            border-radius: var(--radius);
+            border-bottom-left-radius: 4px;
+            display: none;
+        }
+
+        .typing.visible { display: flex; gap: 5px; align-items: center; }
+
+        .typing span {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background: var(--muted);
+            animation: bounce 1.4s infinite ease-in-out;
+        }
+
+        .typing span:nth-child(2) { animation-delay: 0.2s; }
+        .typing span:nth-child(3) { animation-delay: 0.4s; }
+
+        @keyframes bounce {
+            0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+            30% { transform: translateY(-6px); opacity: 1; }
+        }
+
+        /* ── Input ──────────────────────────────── */
+        .input-area {
+            padding: 14px 20px;
+            border-top: 1px solid var(--border);
+            display: flex;
+            gap: 10px;
+            align-items: flex-end;
+            flex-shrink: 0;
+        }
+
+        .input-area textarea {
+            flex: 1;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 10px 14px;
+            font-size: 14.5px;
+            font-family: inherit;
+            resize: none;
+            background: var(--bg);
+            color: var(--agent-text);
+            line-height: 1.4;
+            max-height: 120px;
+            overflow-y: auto;
+        }
+
+        .input-area textarea:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(0, 102, 204, 0.15);
+        }
+
+        .input-area textarea::placeholder { color: var(--muted); }
+
+        .send-btn {
+            background: var(--accent);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            padding: 10px 18px;
+            font-size: 14.5px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: opacity 0.15s;
+            white-space: nowrap;
+        }
+
+        .send-btn:hover { opacity: 0.85; }
+        .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .send-btn:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+        /* ── Footer ─────────────────────────────── */
+        .footer {
+            padding: 8px 20px;
+            text-align: center;
+            font-size: 11.5px;
+            color: var(--muted);
+            border-top: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+
+        /* ── Info panel ─────────────────────────── */
+        .info-panel {
+            display: none;
+            padding: 16px 20px;
+            background: var(--agent-bubble);
+            border-bottom: 1px solid var(--border);
+            font-size: 13px;
+            line-height: 1.6;
+        }
+
+        .info-panel.visible { display: block; }
+        .info-panel dt { font-weight: 600; display: inline; }
+        .info-panel dd { display: inline; margin-left: 4px; margin-right: 16px; }
+
+        /* ── Timing panel ──────────────────────── */
+        .timing-panel {
+            margin-top: 10px;
+            padding: 10px 14px;
+            background: var(--bg);
+            border-radius: 10px;
+            font-size: 12px;
+            font-family: "SF Mono", Menlo, monospace;
+            line-height: 1.6;
+        }
+
+        .timing-header {
+            font-weight: 600;
+            color: var(--muted);
+            margin-bottom: 6px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            font-size: 12px;
+        }
+
+        .timing-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 3px;
+        }
+
+        .timing-label {
+            width: 160px;
+            flex-shrink: 0;
+            color: var(--muted);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .timing-bar-track {
+            flex: 1;
+            height: 14px;
+            background: var(--border);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        .timing-bar {
+            height: 100%;
+            border-radius: 3px;
+            min-width: 2px;
+            transition: width 0.3s ease;
+        }
+
+        .timing-bar.db_query { background: var(--accent); }
+        .timing-bar.cdn_fetch { background: #f59e0b; }
+        .timing-bar.s3_fetch { background: #10b981; }
+        .timing-bar.memory { background: var(--muted); }
+        .timing-bar.total { background: var(--muted); opacity: 0.5; }
+
+        .timing-ms {
+            width: 60px;
+            flex-shrink: 0;
+            text-align: right;
+            color: var(--agent-text);
+        }
+
+        .timing-legend {
+            display: flex;
+            gap: 12px;
+            margin-top: 6px;
+            font-size: 11px;
+            color: var(--muted);
+        }
+
+        .timing-legend-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 2px;
+            margin-right: 3px;
+            vertical-align: middle;
+        }
+
+        /* ── Responsive ─────────────────────────── */
+        @media (max-width: 768px) {
+            .container { max-width: 100%; }
+            .message { max-width: 88%; }
+            .send-btn { padding: 10px 14px; }
+        }
+
+        /* Tool chip — running tool indicator */
+        .tool-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 12px;
+            background: var(--bg-elevated, rgba(0,0,0,0.04));
+            border: 1px solid var(--border, rgba(0,0,0,0.08));
+            border-radius: 999px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 12px;
+            color: var(--muted);
+            margin: 4px 0;
+        }
+        .tool-chip-dot {
+            width: 4px;
+            height: 4px;
+            background: var(--accent, #3b82f6);
+            border-radius: 50%;
+            animation: tool-pulse 1.2s ease-in-out infinite;
+        }
+        .tool-chip-dot:nth-child(2) { animation-delay: 0.15s; }
+        .tool-chip-dot:nth-child(3) { animation-delay: 0.3s; }
+        @keyframes tool-pulse {
+            0%, 60%, 100% { opacity: 0.3; transform: scale(1); }
+            30%           { opacity: 1;   transform: scale(1.4); }
+        }
+        .tool-chip.done .tool-chip-dot { animation: none; opacity: 0.4; }
+
+        /* Federation chip — multi-cloud "data layer travels with the agent".
+           Green = local/in-process (stable, fast), amber = cross-cloud reach,
+           echoing the whitepaper's Fig 1/2 colour language. */
+        .tool-chip.federation {
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 6px;
+            border-radius: 14px;
+        }
+        .tool-chip.federation .tool-chip-head {
+            display: inline-flex; align-items: center; gap: 8px;
+        }
+        .cloud-tags { display: flex; flex-wrap: wrap; gap: 5px; }
+        .cloud-tag {
+            font-size: 11px; line-height: 1; padding: 4px 8px;
+            border-radius: 999px; border: 1px solid transparent;
+            white-space: nowrap;
+        }
+        .cloud-tag.local {
+            color: #047857; background: rgba(16,185,129,0.12);
+            border-color: rgba(16,185,129,0.30);
+        }
+        .cloud-tag.cloud {
+            color: #b45309; background: rgba(245,158,11,0.12);
+            border-color: rgba(245,158,11,0.30);
+        }
+
+        /* Hide empty text container so first chip doesn't sit on a blank gap */
+        .bubble-text:empty { display: none; }
+        .bubble-text + .tool-chip { margin-top: 8px; }
+
+        /* Metrics footer — small line under each agent bubble */
+        .metrics-footer {
+            font-size: 11px;
+            color: var(--muted);
+            margin-top: 6px;
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        }
+        .metrics-footer a {
+            color: var(--accent, #3b82f6);
+            text-decoration: none;
+        }
+        .metrics-footer a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <h1>
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="6" width="22" height="12" rx="2"/><line x1="12" y1="2" x2="12" y2="6"/><circle cx="8" cy="18" r="2"/><circle cx="16" cy="18" r="2"/></svg>
+                NYC Taxi Agent
+            </h1>
+            <div class="header-actions">
+                <button class="header-btn" id="infoBtn" aria-label="Show agent info">i</button>
+                <button class="header-btn" id="themeBtn" aria-label="Toggle dark mode"></button>
+            </div>
+        </header>
+
+        <div class="info-panel" id="infoPanel" role="complementary" aria-label="Agent information">
+            <dl>
+                <dt>Engine:</dt><dd>chDB (embedded ClickHouse)</dd>
+                <dt>Rows:</dt><dd id="infoRows">loading...</dd>
+                <dt>Status:</dt><dd id="infoStatus">checking...</dd>
+                <dt>Version:</dt><dd id="infoVersion">3.0.0</dd>
+            </dl>
+            <div style="margin-top:8px">
+                <a href="/docs" style="color:var(--accent);text-decoration:none;font-size:12px">API Docs (Swagger)</a>
+            </div>
+        </div>
+
+        <div class="messages" id="messages" role="log" aria-live="polite" aria-label="Conversation">
+            <div class="message welcome">
+                <strong>Welcome!</strong> I'm an AI analyst with NYC taxi data embedded in my engine. Ask me anything about fares, trips, trends, or zones.
+                <div class="suggestions" id="suggestions">
+                    <button class="suggestion-chip" tabindex="0">Average fare in Manhattan?</button>
+                    <button class="suggestion-chip" tabindex="0">Busiest hour of the day?</button>
+                    <button class="suggestion-chip" tabindex="0">Compare avg fares from 2024 baked data vs latest 2026 fresh data</button>
+                    <button class="suggestion-chip" tabindex="0">Any new trips after Dec 2025? Check fresh NYC TLC data</button>
+                    <button class="suggestion-chip" tabindex="0">Do rainy days have more taxi trips?</button>
+                    <button class="suggestion-chip" tabindex="0">How does temperature affect taxi fares?</button>
+                </div>
+            </div>
+            <div class="typing" id="typing" role="status" aria-label="Agent is thinking">
+                <span></span><span></span><span></span>
+            </div>
+        </div>
+
+        <div class="input-area">
+            <textarea id="input" rows="1" placeholder="Ask about NYC taxi trips..." aria-label="Your question"></textarea>
+            <button class="send-btn" id="sendBtn" aria-label="Send message">Send</button>
+        </div>
+
+        <footer class="footer">
+            Powered by chDB 4.x + Strands Agents + Amazon Bedrock
+        </footer>
+    </div>
+
+    <script>
+        const messagesEl = document.getElementById('messages');
+        const typingEl = document.getElementById('typing');
+        const inputEl = document.getElementById('input');
+        const sendBtn = document.getElementById('sendBtn');
+        const suggestionsEl = document.getElementById('suggestions');
+        const themeBtn = document.getElementById('themeBtn');
+        const infoBtn = document.getElementById('infoBtn');
+        const infoPanel = document.getElementById('infoPanel');
+
+        let isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+        let isSending = false;
+
+        // Federation tools render a richer chip showing the data planes they
+        // span — green = local/in-process, amber = cross-cloud reach (Fig 1/2).
+        const FED_TOOL_META = {
+            analyze_fleet_across_clouds: {
+                label: 'Federating across clouds',
+                clouds: [
+                    { label: 'local chDB', kind: 'local' },
+                    { label: 'AWS S3',     kind: 'cloud' },
+                    { label: 'Azure',      kind: 'cloud' },
+                    { label: 'GCS',        kind: 'cloud' },
+                    { label: 'ClickHouse Cloud', kind: 'cloud' },
+                ],
+            },
+            analyze_zone_tipping: {
+                label: 'Zone tipping · chDB ⨝ Postgres',
+                clouds: [
+                    { label: 'local chDB',  kind: 'local' },
+                    { label: 'PostgreSQL',  kind: 'cloud' },
+                ],
+            },
+        };
+
+        // ── Theme ──────────────────────────────────
+        function applyTheme() {
+            document.body.classList.toggle('dark', isDark);
+            themeBtn.textContent = isDark ? '\u2600' : '\u263D';
+        }
+        applyTheme();
+
+        themeBtn.addEventListener('click', () => {
+            isDark = !isDark;
+            applyTheme();
+        });
+
+        // ── Info Panel ─────────────────────────────
+        infoBtn.addEventListener('click', () => {
+            infoPanel.classList.toggle('visible');
+        });
+
+        fetch('/health').then(r => r.json()).then(data => {
+            document.getElementById('infoRows').textContent =
+                data.rows_available ? data.rows_available.toLocaleString() : 'unknown';
+            document.getElementById('infoStatus').textContent = data.status || 'unknown';
+            document.getElementById('infoVersion').textContent = data.version || '?';
+        }).catch(() => {
+            document.getElementById('infoStatus').textContent = 'unavailable';
+        });
+
+        // ── Auto-resize textarea ───────────────────
+        inputEl.addEventListener('input', () => {
+            inputEl.style.height = 'auto';
+            inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px';
+        });
+
+        // ── Suggestions ────────────────────────────
+        suggestionsEl.addEventListener('click', (e) => {
+            if (e.target.classList.contains('suggestion-chip')) {
+                sendMessage(e.target.textContent);
+            }
+        });
+
+        // ── Markdown-lite renderer ─────────────────
+        function renderText(text) {
+            let html = text
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+            // Bold
+            html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+            // Inline code
+            html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+            // Paragraphs
+            html = html.replace(/\n\n/g, '</p><p>');
+            // Line breaks
+            html = html.replace(/\n/g, '<br>');
+            return '<p>' + html + '</p>';
+        }
+
+        // ── Timing panel renderer ──────────────────
+        function renderTimingPanel(entries, totalMs) {
+            const panel = document.createElement('div');
+            panel.className = 'timing-panel';
+
+            // Filter out the "total" entry for the bar chart
+            const ops = entries.filter(e => e.category !== 'total');
+            const maxMs = Math.max(...ops.map(e => e.elapsed_ms), 1);
+
+            let html = '<div class="timing-header">' +
+                String.fromCodePoint(0x23F1) + ' ' +
+                totalMs.toLocaleString() + 'ms total</div>';
+
+            for (const entry of ops) {
+                const pct = Math.max((entry.elapsed_ms / maxMs) * 100, 1);
+                const detail = entry.detail ? ' (' + entry.detail.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])) + ')' : '';
+                html += '<div class="timing-row">' +
+                    '<span class="timing-label" title="' + entry.label + detail + '">' + entry.label + '</span>' +
+                    '<div class="timing-bar-track"><div class="timing-bar ' + entry.category + '" style="width:' + pct + '%"></div></div>' +
+                    '<span class="timing-ms">' + entry.elapsed_ms.toLocaleString() + 'ms</span>' +
+                    '</div>';
+            }
+
+            // Legend
+            const categories = [...new Set(ops.map(e => e.category))];
+            const catLabels = { db_query: 'DB Query', cdn_fetch: 'CDN Fetch', s3_fetch: 'S3 Fetch', memory: 'Memory' };
+            const catColors = { db_query: 'var(--accent)', cdn_fetch: '#f59e0b', s3_fetch: '#10b981', memory: 'var(--muted)' };
+
+            if (categories.length > 1) {
+                html += '<div class="timing-legend">';
+                for (const cat of categories) {
+                    html += '<span><span class="timing-legend-dot" style="background:' + (catColors[cat] || 'var(--muted)') + '"></span>' + (catLabels[cat] || cat) + '</span>';
+                }
+                html += '</div>';
+            }
+
+            panel.innerHTML = html;
+            return panel;
+        }
+
+        // ── Message rendering ──────────────────────
+        function appendMessage(role, text) {
+            // Hide suggestions after first user message
+            if (role === 'user' && suggestionsEl) {
+                suggestionsEl.style.display = 'none';
+            }
+
+            const div = document.createElement('div');
+            div.className = 'message ' + role;
+
+            if (role === 'agent') {
+                div.innerHTML = renderText(text);
+            } else {
+                div.textContent = text;
+            }
+
+            // Insert before typing indicator
+            messagesEl.insertBefore(div, typingEl);
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+            return div;
+        }
+
+        // ── Create empty agent bubble for streaming ──
+        function createAgentBubble() {
+            const div = document.createElement('div');
+            div.className = 'message agent';
+            div.innerHTML = '';
+            messagesEl.insertBefore(div, typingEl);
+            return div;
+        }
+
+        // ── Metrics footer (token counts, latency, model, optional cost, trace link) ──
+        function renderMetricsFooter(bubble, m, toolStats) {
+            // Collapse chips: remove the live indicators, replace with a compact
+            // summary line showing per-tool counts and durations.
+            bubble.querySelectorAll('.tool-chip').forEach(el => el.remove());
+
+            const footer = document.createElement('div');
+            footer.className = 'metrics-footer';
+            const parts = [];
+            if (m.tokens_in != null)  parts.push('↑ ' + Number(m.tokens_in).toLocaleString() + ' in');
+            if (m.tokens_out != null) parts.push('↓ ' + Number(m.tokens_out).toLocaleString() + ' out');
+            if (m.tools_used && m.tools_used.length) parts.push(m.tools_used.length + ' tool' + (m.tools_used.length === 1 ? '' : 's'));
+            if (m.model) {
+                const shortModel = String(m.model).replace(/^.*?anthropic\./, '').replace(/-v[0-9:]+$/, '');
+                parts.push(shortModel);
+            }
+            footer.innerHTML = parts.map(p => '<span>' + p + '</span>').join('');
+
+            // Tool-summary line (separate row beneath token row).
+            if (toolStats && Object.keys(toolStats).length) {
+                const toolLine = document.createElement('div');
+                toolLine.className = 'metrics-footer';
+                toolLine.style.marginTop = '2px';
+                const summary = Object.entries(toolStats)
+                    .map(([name, s]) => '<span>🛠 ' + name + ' ×' + s.count + '</span>')
+                    .join('');
+                toolLine.innerHTML = summary;
+                bubble.appendChild(toolLine);
+            }
+
+            // Cost (placeholder until /metrics returns) and Langfuse link.
+            if (m.trace_id) {
+                const costEl = document.createElement('span');
+                costEl.textContent = '$ …';
+                footer.appendChild(costEl);
+
+                let langfuseLink = null;
+                if (m.trace_url) {
+                    langfuseLink = document.createElement('a');
+                    langfuseLink.href = m.trace_url;
+                    langfuseLink.target = '_blank';
+                    langfuseLink.rel = 'noopener noreferrer';
+                    langfuseLink.textContent = 'View in Langfuse ↗';
+                    langfuseLink.style.opacity = '0.4';
+                    langfuseLink.style.pointerEvents = 'none';
+                    langfuseLink.title = 'Waiting for Langfuse ingestion…';
+                    footer.appendChild(langfuseLink);
+                }
+
+                const delays = [0, 5000, 10000, 15000];
+                let attempt = 0;
+                const tryFetch = () => {
+                    fetch('/metrics/' + m.trace_id)
+                        .then(r => r.json())
+                        .then(d => {
+                            if (d && d.available) {
+                                if (d.cost_usd != null) {
+                                    costEl.textContent = '$' + Number(d.cost_usd).toFixed(4);
+                                } else {
+                                    costEl.remove();
+                                }
+                                if (langfuseLink) {
+                                    langfuseLink.style.opacity = '1';
+                                    langfuseLink.style.pointerEvents = '';
+                                    langfuseLink.title = '';
+                                }
+                                return;
+                            }
+                            attempt++;
+                            if (attempt < delays.length) {
+                                setTimeout(tryFetch, delays[attempt]);
+                            } else {
+                                costEl.remove();
+                                if (langfuseLink) langfuseLink.remove();
+                            }
+                        })
+                        .catch(() => {
+                            costEl.remove();
+                            if (langfuseLink) langfuseLink.remove();
+                        });
+                };
+                tryFetch();
+            }
+
+            bubble.appendChild(footer);
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        }
+
+        // ── Send message (streaming) ──────────────
+        async function sendMessage(text) {
+            text = text.trim();
+            if (!text || isSending) return;
+
+            isSending = true;
+            sendBtn.disabled = true;
+            inputEl.disabled = true;
+
+            appendMessage('user', text);
+            inputEl.value = '';
+            inputEl.style.height = 'auto';
+
+            // Show typing indicator
+            typingEl.classList.add('visible');
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 120000);
+
+            try {
+                const res = await fetch('/chat/stream', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text }),
+                    signal: controller.signal,
+                });
+                clearTimeout(timeout);
+
+                if (res.status === 429) {
+                    throw new Error('Too many requests. Please wait a moment.');
+                }
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    throw new Error(err.detail || 'Request failed (' + res.status + ')');
+                }
+
+                // Switch from typing dots to streaming bubble
+                typingEl.classList.remove('visible');
+                const bubble = createAgentBubble();
+                let textEl = bubble.querySelector('.bubble-text');
+                if (!textEl) {
+                    textEl = document.createElement('div');
+                    textEl.className = 'bubble-text';
+                    bubble.appendChild(textEl);
+                }
+                // Per-tool stats: {name: {count, totalMs, _open: [startTs]}}.
+                const toolStats = {};
+                let fullText = '';
+
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop();
+
+                    for (const line of lines) {
+                        if (!line.startsWith('data: ')) continue;
+                        const payload = JSON.parse(line.slice(6));
+
+                        if (payload.type === 'text') {
+                            fullText += payload.content;
+                            textEl.innerHTML = renderText(fullText);
+                            messagesEl.scrollTop = messagesEl.scrollHeight;
+                        } else if (payload.type === 'tool') {
+                            const name = (payload.name || '').replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c]));
+                            if (payload.status === 'start') {
+                                if (!toolStats[name]) toolStats[name] = { count: 0, totalMs: 0, _open: [] };
+                                toolStats[name].count++;
+                                toolStats[name]._open.push(performance.now());
+                                const chip = document.createElement('div');
+                                chip.dataset.toolName = name;
+                                const fed = FED_TOOL_META[name];
+                                const dots =
+                                    '<span class="tool-chip-dot"></span>' +
+                                    '<span class="tool-chip-dot"></span>' +
+                                    '<span class="tool-chip-dot"></span>';
+                                if (fed) {
+                                    chip.className = 'tool-chip federation';
+                                    const tags = fed.clouds.map(c =>
+                                        '<span class="cloud-tag ' + c.kind + '">' + c.label + '</span>'
+                                    ).join('');
+                                    chip.innerHTML =
+                                        '<div class="tool-chip-head"><span>' + fed.label + '</span>' + dots + '</div>' +
+                                        '<div class="cloud-tags">' + tags + '</div>';
+                                } else {
+                                    chip.className = 'tool-chip';
+                                    chip.innerHTML = '<span>' + name + '</span>' + dots;
+                                }
+                                bubble.appendChild(chip);
+                                messagesEl.scrollTop = messagesEl.scrollHeight;
+                            } else if (payload.status === 'end') {
+                                if (toolStats[name] && toolStats[name]._open.length > 0) {
+                                    toolStats[name].totalMs += performance.now() - toolStats[name]._open.pop();
+                                }
+                                const chips = bubble.querySelectorAll('.tool-chip[data-tool-name="' + name + '"]:not(.done)');
+                                if (chips.length > 0) chips[chips.length - 1].classList.add('done');
+                            }
+                        } else if (payload.type === 'timing') {
+                            bubble.appendChild(renderTimingPanel(payload.entries, payload.total_ms));
+                            messagesEl.scrollTop = messagesEl.scrollHeight;
+                        } else if (payload.type === 'error') {
+                            throw new Error(payload.content);
+                        } else if (payload.type === 'done') {
+                            if (payload.metrics) {
+                                renderMetricsFooter(bubble, payload.metrics, toolStats);
+                            }
+                        }
+                    }
+                }
+
+            } catch (err) {
+                clearTimeout(timeout);
+                typingEl.classList.remove('visible');
+                const msg = err.name === 'AbortError'
+                    ? 'The query took too long. Try a simpler question.'
+                    : err.message;
+                appendMessage('error', msg);
+            } finally {
+                isSending = false;
+                sendBtn.disabled = false;
+                inputEl.disabled = false;
+                inputEl.focus();
+            }
+        }
+
+        // ── Event listeners ────────────────────────
+        sendBtn.addEventListener('click', () => sendMessage(inputEl.value));
+
+        inputEl.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage(inputEl.value);
+            }
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') infoPanel.classList.remove('visible');
+        });
+
+        // Focus input on load
+        inputEl.focus();
+    </script>
+</body>
+</html>

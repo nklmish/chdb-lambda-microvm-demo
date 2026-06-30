@@ -1,0 +1,37 @@
+name: Agent Evaluation
+
+# Manual-only (workflow_dispatch). This is the heavy evaluation flywheel: it
+# deploys a real AgentCore Runtime to AWS and runs an OpenAI-judged factuality
+# gate, so it is NOT run automatically on push/PR. Run it on demand from the
+# Actions tab once the required infrastructure and secrets exist.
+#
+# Required repo secrets:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY  — an IAM principal that can deploy
+#       the AgentCore stack (see .claude/skills/deploy-agentcore)
+#   OPENAI_API_KEY                            — autoevals Factuality judge
+on:
+  workflow_dispatch:
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install -r requirements.txt
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      - run: bash cicd/deploy_agent.sh TST  # SDK-direct via scripts/create_runtime.py
+      - run: python cicd/tst.py          # Run evaluation with autoevals
+      - run: python cicd/check_factuality.py  # Quality gate check
+      - run: bash cicd/delete_agent.sh  # Cleanup test agent
+      # PRD auto-promote intentionally omitted in
+      # See ledger note D-D15-PRD-AUTO-PROMOTE-SCOPE for options:
+      # (1) GH environment protection with manual approval
+      # (2) tag-triggered deploy workflow (on push of v* tags)
+      # (3) separate manual workflow_dispatch pipeline
