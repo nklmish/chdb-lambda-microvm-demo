@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Serverless Distributed Scan</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        :root {
+            --bg:#f8f9fa; --surface:#fff; --border:#e0e0e0; --muted:#6b7280; --accent:#0066cc;
+            --text:#1a1a1a; --ok:#10b981; --warn:#f59e0b; --err:#dc2626; --radius:14px;
+        }
+        body.dark {
+            --bg:#1a1a2e; --surface:#16213e; --border:#2a2a4a; --muted:#9ca3af; --accent:#4d94ff;
+            --text:#e0e0e0; --ok:#34d399; --warn:#fbbf24; --err:#ef4444;
+        }
+        body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+            background:var(--bg); color:var(--text); min-height:100vh; padding:0 0 40px; }
+        .wrap { max-width:1100px; margin:0 auto; padding:0 20px; }
+        header { display:flex; align-items:center; justify-content:space-between; padding:16px 20px;
+            border-bottom:1px solid var(--border); max-width:1100px; margin:0 auto; }
+        header h1 { font-size:18px; font-weight:600; display:flex; align-items:center; gap:8px; }
+        .icon-btn { background:none; border:1px solid var(--border); border-radius:8px; padding:6px 10px;
+            cursor:pointer; color:var(--muted); font-size:13px; }
+        .quote { color:var(--muted); font-size:13.5px; font-style:italic; margin:14px 0 4px; line-height:1.5; }
+        .disclaimer { font-size:12.5px; color:var(--warn); background:color-mix(in srgb,var(--warn) 10%,transparent);
+            border:1px solid color-mix(in srgb,var(--warn) 30%,transparent); border-radius:10px;
+            padding:8px 12px; margin:12px 0; }
+        .controls { display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; margin:12px 0; padding:16px;
+            background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); }
+        .field { display:flex; flex-direction:column; gap:4px; }
+        .field label { font-size:11.5px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+        .field input, .field select { padding:8px 10px; font-size:14px; font-family:inherit;
+            border:1px solid var(--border); border-radius:8px; background:var(--bg); color:var(--text); }
+        .field input { width:120px; }
+        .field select { width:230px; }
+        button.primary { background:var(--accent); color:#fff; border:none; border-radius:8px; padding:9px 18px;
+            font-size:14px; font-weight:500; cursor:pointer; }
+        button.primary:disabled { opacity:.45; cursor:not-allowed; }
+        button.ghost { background:none; color:var(--err); border:1px solid var(--border); border-radius:8px;
+            padding:9px 14px; font-size:13.5px; cursor:pointer; }
+        .phase { font-size:13px; color:var(--muted); margin:8px 0; min-height:18px;
+            font-family:ui-monospace,Menlo,monospace; }
+        .err-box { color:var(--err); background:color-mix(in srgb,var(--err) 8%,transparent);
+            border:1px solid color-mix(in srgb,var(--err) 30%,transparent); border-radius:10px;
+            padding:10px 14px; margin:10px 0; display:none; }
+        .err-box.show { display:block; }
+
+        .headline { display:none; margin:6px 0 16px; padding:16px 18px; border-radius:var(--radius);
+            background:var(--surface); border:1px solid var(--border); }
+        .headline.show { display:block; }
+        .metrics { display:flex; flex-wrap:wrap; gap:26px; }
+        .metric .v { font-size:22px; font-weight:700; }
+        .metric .v.ok { color:var(--ok); }
+        .metric .k { font-size:11.5px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+        .subnote { font-size:12px; color:var(--muted); margin-top:10px; }
+
+        .answer { display:none; margin:0 0 16px; padding:14px 18px; background:var(--surface);
+            border:1px solid var(--border); border-radius:var(--radius); }
+        .answer.show { display:block; }
+        .answer h3 { font-size:13px; color:var(--muted); font-weight:600; margin-bottom:10px; }
+        .yr { display:flex; align-items:center; gap:10px; font-size:12.5px;
+            font-family:ui-monospace,Menlo,monospace; margin-bottom:3px; }
+        .yr .lbl { width:150px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .yr .track { flex:1; height:12px; background:var(--border); border-radius:3px; overflow:hidden; }
+        .yr .fill { height:100%; background:var(--accent); border-radius:3px; min-width:2px; }
+        .yr .val { width:190px; text-align:right; }
+
+        .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); gap:10px; }
+        .card { background:var(--surface); border:1px solid var(--border); border-left:4px solid var(--border);
+            border-radius:12px; padding:10px 12px; transition:border-color .2s; }
+        .card.scanned { border-left-color:var(--ok); }
+        .card.error { border-left-color:var(--err); }
+        .card-head { display:flex; align-items:center; gap:8px; margin-bottom:4px; }
+        .card-head .idx { font-weight:700; font-size:14px; }
+        .dot { width:8px; height:8px; border-radius:50%; background:var(--muted); }
+        .dot.wait,.dot.resume,.dot.scan { background:var(--warn); animation:pulse 1.1s infinite; }
+        .dot.ready { background:var(--accent); }
+        .dot.scanned { background:var(--ok); }
+        @keyframes pulse { 0%,100%{opacity:.35} 50%{opacity:1} }
+        .st { font-size:11px; color:var(--muted); text-transform:uppercase; margin-left:auto; letter-spacing:.03em; }
+        .m { font-family:ui-monospace,Menlo,monospace; font-size:12px; }
+        .m .rows { font-weight:600; }
+        .m .k { color:var(--muted); }
+        footer { text-align:center; color:var(--muted); font-size:12px; margin-top:26px; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h10"/><circle cx="19" cy="18" r="2"/></svg>
+            Serverless Distributed Scan
+        </h1>
+        <button class="icon-btn" id="themeBtn" aria-label="Toggle dark mode">☾</button>
+    </header>
+    <div class="wrap">
+        <p class="quote">"ClickHouse Cloud is where your data lives, chDB is what your agent thinks with,
+            and Lambda MicroVMs is where it gets to think — in private." Launch N Firecracker microVMs
+            (each a private chDB), suspend to <b>$0</b>, resume snapshot-hot, then scatter shards of a
+            public S3 dataset — e.g. <b>~2.5&nbsp;billion Overture buildings</b> — at every engine's
+            <code>/scan</code> and merge. Nothing is ingested or copied; the data is read straight from S3.</p>
+        <div class="disclaimer">⚠ Illustrative <b>single run</b> — not a benchmark. No warm-up, no repeated
+            trials, no controlled network; numbers move run to run. The robust claims are the <b>shape</b>:
+            $0 compute at rest, per-request isolation, per-second billing.</div>
+
+        <div class="controls">
+            <div class="field"><label for="dataset">Dataset</label><select id="dataset"></select></div>
+            <div class="field"><label for="count">Fleet size</label><input type="number" id="count" min="1" max="50" value="20"></div>
+            <div class="field"><label for="region">Region</label><input type="text" id="region" value="us-west-2"></div>
+            <button class="primary" id="launchBtn">Run scan</button>
+            <button class="ghost" id="termBtn" disabled>Terminate now</button>
+        </div>
+
+        <div class="err-box" id="errBox"></div>
+        <div class="phase" id="phase"></div>
+
+        <div class="headline" id="headline">
+            <div class="metrics">
+                <div class="metric"><div class="v ok" id="mRows">—</div><div class="k">rows scanned</div></div>
+                <div class="metric"><div class="v" id="mWall">—</div><div class="k">wall-clock</div></div>
+                <div class="metric"><div class="v" id="mTput">—</div><div class="k">throughput (aggregate)</div></div>
+                <div class="metric"><div class="v" id="mCost">—</div><div class="k">cost / this run</div></div>
+                <div class="metric"><div class="v ok" id="mRest">$0</div><div class="k">compute at rest</div></div>
+            </div>
+            <div class="subnote" id="mSub"></div>
+        </div>
+
+        <div class="answer" id="answer">
+            <h3>NYC yellow-taxi tip rate by year — merged from every shard (the analytical answer)</h3>
+            <div id="years"></div>
+        </div>
+
+        <div class="grid" id="grid"></div>
+        <footer>Firecracker-isolated chDB engines · private S3 lake · one image, N ephemeral workers.
+            Ids logged server-side; fleet auto-terminates when the run ends.</footer>
+    </div>
+
+    <script>
+        const $ = id => document.getElementById(id);
+        let isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+        const applyTheme = () => { document.body.classList.toggle('dark', isDark); $('themeBtn').textContent = isDark ? '☀' : '☾'; };
+        applyTheme();
+        $('themeBtn').onclick = () => { isDark = !isDark; applyTheme(); };
+
+        let controller = null;
+        const cards = {};
+        fetch('/config').then(r => r.json()).then(c => {
+            if (c.defaultRegion) $('region').value = c.defaultRegion;
+            if (c.maxFleet) $('count').max = c.maxFleet;
+            const sel = $('dataset');
+            (c.datasets || []).forEach(d => {
+                const o = document.createElement('option');
+                o.value = d.key; o.textContent = `${d.label} — ${d.answer}`;
+                if (d.key === c.defaultDataset) o.selected = true;
+                sel.appendChild(o);
+            });
+        }).catch(() => {});
+        const esc = s => String(s).replace(/[<>&"']/g, m => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[m]));
+        const fmt = n => Number(n).toLocaleString();
+
+        function setState(c, state, label) {
+            c.querySelector('.dot').className = 'dot ' + state;
+            c.querySelector('.st').textContent = label || state;
+        }
+        function makeCard(vm) {
+            const el = document.createElement('div');
+            el.className = 'card'; el.dataset.idx = vm.idx;
+            el.innerHTML = '<div class="card-head"><span class="idx">#' + vm.idx + '</span>' +
+                '<span class="dot wait"></span><span class="st">launching</span></div>' +
+                '<div class="m"><span class="rows">—</span> <span class="k">rows</span></div>' +
+                '<div class="m"><span class="k">at</span> <span class="rate">—</span></div>';
+            $('grid').appendChild(el); cards[vm.idx] = el;
+        }
+        function finish() { $('launchBtn').disabled = false; $('termBtn').disabled = true; controller = null; }
+
+        function renderAnswer(rows, label) {
+            document.querySelector('#answer h3').textContent =
+                (label || 'answer') + ' — merged from every shard (the analytical answer)';
+            const unit = rows.length ? rows[0].unit : '';
+            const scale = Math.max(...rows.map(r => r.value), 1) || 1;
+            $('years').innerHTML = rows.slice(0, 12).map(r => {
+                const val = unit === '%' ? (r.value.toFixed(1) + '%  ·  ' + fmt(r.count) + ' trips') : fmt(r.count);
+                return '<div class="yr"><span class="lbl" title="' + esc(String(r.label)) + '">' + esc(String(r.label)) + '</span>' +
+                    '<span class="track"><span class="fill" style="width:' + (r.value / scale * 100) + '%"></span></span>' +
+                    '<span class="val">' + val + '</span></div>';
+            }).join('');
+            $('answer').classList.add('show');
+        }
+
+        function handle(d) {
+            if (d.type === 'preflight') {
+                const rel = d.release ? ` · release ${d.release}` : '';
+                $('phase').textContent = `${d.label} (${d.rows_hint} rows)${rel} · ${d.files} parquet files · launching ${d.n} private chDB engines · image v${d.version}`;
+            } else if (d.type === 'launch') {
+                d.vms.forEach(makeCard);
+            } else if (d.type === 'ready') {
+                const c = cards[d.idx]; if (c) setState(c, 'ready', 'ready ' + (d.ready_s ?? '?') + 's');
+            } else if (d.type === 'suspend') {
+                $('phase').textContent = 'fleet suspended → $0 compute at rest · resuming snapshot-hot …';
+                Object.values(cards).forEach(c => setState(c, 'resume', 'resuming'));
+            } else if (d.type === 'resumed') {
+                const c = cards[d.idx]; if (c) setState(c, 'ready', 'hot');
+            } else if (d.type === 'scatter') {
+                $('phase').textContent = `scatter: ${d.shards.length} shards — firing /scan at every engine concurrently …`;
+                Object.values(cards).forEach(c => setState(c, 'scan', 'scanning'));
+            } else if (d.type === 'scanned') {
+                const c = cards[d.idx]; if (!c) return;
+                const mbps = d.scan_ms ? (d.bytes / 1e6) / (d.scan_ms / 1000) : 0;
+                c.querySelector('.rows').textContent = fmt(d.rows);
+                c.querySelector('.rate').textContent = (d.scan_ms / 1000).toFixed(1) + 's · ' + mbps.toFixed(0) + ' MB/s';
+                if (d.rows > 0) { setState(c, 'scanned', 'done'); c.classList.add('scanned'); }
+                else { setState(c, 'error', 'error'); c.classList.add('error'); }
+            } else if (d.type === 'done') {
+                const c = d.cost || {};
+                $('mRows').textContent = fmt(d.total_rows);
+                $('mWall').textContent = (d.wall_ms / 1000).toFixed(1) + ' s';
+                $('mTput').textContent = (d.rows_per_s / 1e6).toFixed(0) + ' M rows/s';
+                $('mCost').textContent = '$' + (c.burst_usd ?? 0).toFixed(2);
+                $('mSub').innerHTML = `${d.n} microVMs · ${(c.mem_gb).toFixed(0)} GB / ~${(c.vcpu).toFixed(0)} vCPU (assumed) · ` +
+                    `cost = compute $${(c.compute_usd).toFixed(3)} + snapshot $${(c.snapshot_usd).toFixed(2)} · ` +
+                    `at rest ~$${c.at_rest_usd_per_hour}/hr storage` +
+                    (d.resume_ms != null ? ` · resumed from $0 in ~${(d.resume_ms/1000).toFixed(0)}s (rate-limited)` : '');
+                $('headline').classList.add('show');
+                renderAnswer(d.answer || [], d.answer_label || '');
+                $('phase').textContent = `${d.ok}/${d.n} engines answered.`;
+            } else if (d.type === 'terminated') {
+                $('phase').textContent += `  fleet terminated (${d.ids.length} microVMs).`;
+            } else if (d.type === 'error') {
+                $('errBox').textContent = 'Error: ' + d.message; $('errBox').classList.add('show');
+            }
+        }
+
+        async function launch() {
+            if (controller) return;
+            Object.keys(cards).forEach(k => delete cards[k]);
+            $('grid').innerHTML = ''; $('headline').classList.remove('show');
+            $('answer').classList.remove('show'); $('errBox').classList.remove('show');
+            $('phase').textContent = 'requesting fleet …';
+            const count = Math.max(1, Math.min(parseInt($('count').value || '20', 10), 50));
+            const region = encodeURIComponent($('region').value.trim() || 'us-west-2');
+            const dataset = encodeURIComponent($('dataset').value || 'buildings');
+            $('launchBtn').disabled = true; $('termBtn').disabled = false;
+            controller = new AbortController();
+            try {
+                const res = await fetch(`/run?count=${count}&region=${region}&keep=0&dataset=${dataset}`, { signal: controller.signal });
+                if (!res.ok || !res.body) throw new Error('request failed (' + res.status + ')');
+                const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '';
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buf += dec.decode(value, { stream: true });
+                    const lines = buf.split('\n'); buf = lines.pop();
+                    for (const line of lines) { if (line.startsWith('data: ')) handle(JSON.parse(line.slice(6))); }
+                }
+            } catch (err) {
+                if (err.name !== 'AbortError') { $('errBox').textContent = 'Error: ' + err.message; $('errBox').classList.add('show'); }
+            } finally { finish(); }
+        }
+        $('launchBtn').onclick = launch;
+        $('termBtn').onclick = () => {
+            fetch('/terminate', { method: 'POST' }).then(r => r.json()).then(d => {
+                $('phase').textContent = `terminate requested (${d.terminated} microVMs).`;
+            }).catch(() => {});
+            if (controller) controller.abort();
+        };
+    </script>
+</body>
+</html>

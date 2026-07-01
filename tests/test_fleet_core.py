@@ -80,3 +80,54 @@ def test_arn_builders():
         "arn:aws:lambda:us-west-2:123456789012:microvm-image:nyc-taxi-agent-microvm"
     assert fc.exec_role_arn("123456789012") == \
         "arn:aws:iam::123456789012:role/NycTaxiMicroVMExecutionRole"
+
+
+# ── distributed-scan pure helpers ──
+
+def test_shard_months_round_robin_balances():
+    shards = fc.shard_months(["a", "b", "c", "d", "e"], 2)
+    assert shards == [["a", "c", "e"], ["b", "d"]]
+
+
+def test_shard_months_drops_empty_when_more_shards_than_months():
+    shards = fc.shard_months(["a", "b"], 5)
+    assert shards == [["a"], ["b"]]
+
+
+def test_merge_partials_sums_groups_generically():
+    p1 = {"rows_scanned": 100, "bytes_read": 10,
+          "partial": [{"grp": "residential", "rows_read": 60, "cnt": 60}]}
+    p2 = {"rows_scanned": 50, "bytes_read": 5,
+          "partial": [{"grp": "residential", "rows_read": 40, "cnt": 40},
+                      {"grp": "service", "rows_read": 10, "cnt": 10}]}
+    m = fc.merge_partials([p1, p2, None])
+    assert m["total_rows"] == 150 and m["total_bytes"] == 15
+    assert m["groups"]["residential"]["cnt"] == 100     # 60 + 40
+    ans = fc.answer_rows("segments", m)
+    assert ans[0]["label"] == "residential" and ans[0]["count"] == 100  # sorted desc
+
+
+def test_answer_rows_taxi_computes_tip_pct():
+    m = {"groups": {"2015": {"cnt": 100, "tip_sum": 12.0, "fare_sum": 100.0},
+                    "2016": {"cnt": 50, "tip_sum": 9.0, "fare_sum": 50.0}},
+         "total_rows": 150, "total_bytes": 0}
+    ans = fc.answer_rows("taxi", m)
+    assert [r["label"] for r in ans] == ["2015", "2016"]   # sorted by year
+    assert ans[0]["value"] == 12.0 and ans[0]["unit"] == "%"
+    assert ans[1]["value"] == 18.0                          # 9/50*100
+
+
+def test_cost_estimate_uses_real_rates():
+    c = fc.cost_estimate(n=10, vcpu=2, mem_gb=4, run_seconds=5, snapshot_gb=4)
+    # compute = 10 * 5 * (2*vcpu_rate + 4*gb_rate)
+    per_run = 5 * (2 * fc.PRICE_VCPU_SEC + 4 * fc.PRICE_GB_SEC)
+    assert c["compute_usd"] == round(10 * per_run, 4)
+    assert c["burst_usd"] > c["compute_usd"]           # + snapshot read/write
+    assert c["at_rest_usd_per_hour"] >= 0
+    assert c["n"] == 10
+
+
+def test_median():
+    assert fc._median([3, 1, 2]) == 2
+    assert fc._median([4, 1, 2, 3]) == 2.5
+    assert fc._median([None, None]) is None

@@ -250,6 +250,18 @@ def _exec_role_policy(account: str, region: str) -> str:
                         }
                     },
                 },
+                {
+                    # Distributed-scan cold lake: read the private yellow-taxi
+                    # parquet the MicroVM's chDB s3() scans. Least-privilege —
+                    # scoped to this account's artifact bucket's lake/ prefix.
+                    "Sid": "ReadColdLake",
+                    "Effect": "Allow",
+                    "Action": ["s3:GetObject", "s3:ListBucket"],
+                    "Resource": [
+                        f"arn:aws:s3:::nyc-taxi-microvm-artifacts-{account}-{region}",
+                        f"arn:aws:s3:::nyc-taxi-microvm-artifacts-{account}-{region}/lake/*",
+                    ],
+                },
             ],
         }
     )
@@ -416,7 +428,7 @@ def _image_arn(name: str, account: str, region: str) -> str:
     return f"arn:aws:lambda:{region}:{account}:microvm-image:{name}"
 
 
-def _env_vars(region: str) -> str:
+def _env_vars(region: str, account: str) -> str:
     """Baked-in runtime env — no secrets (no Langfuse creds, no ClickHouse creds).
 
     Bedrock region must match where model access is enabled; tracing exporters are
@@ -439,6 +451,9 @@ def _env_vars(region: str) -> str:
             # Where the federation warehouse leg looks up ClickHouse Cloud creds
             # (SSM /clickhouse/*) — may differ from the compute region.
             "CLICKHOUSE_SSM_REGION": CLICKHOUSE_SSM_REGION,
+            # Distributed-scan cold lake (private S3, read via the exec role).
+            "LAKE_BUCKET": f"nyc-taxi-microvm-artifacts-{account}-{region}",
+            "LAKE_PREFIX": "lake/yellow",
             "OTEL_TRACES_EXPORTER": "none",
             "OTEL_METRICS_EXPORTER": "none",
             "DISABLE_ADOT_OBSERVABILITY": "true",
@@ -490,7 +505,7 @@ def create_or_update_image(
             "--build-role-arn", build_role,
             "--code-artifact", code_artifact,
             "--hooks", _hooks_config(),
-            "--environment-variables", _env_vars(region),
+            "--environment-variables", _env_vars(region, account),
             region=region, dry_run=dry_run)
     else:
         print(f"  creating image: {name}")
@@ -501,7 +516,7 @@ def create_or_update_image(
             "--build-role-arn", build_role,
             "--code-artifact", code_artifact,
             "--hooks", _hooks_config(),
-            "--environment-variables", _env_vars(region),
+            "--environment-variables", _env_vars(region, account),
             region=region, dry_run=dry_run)
     return image_arn, prior
 
