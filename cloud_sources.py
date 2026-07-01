@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -67,6 +68,10 @@ _CHC_TABLE = "workshop.nyc_taxi_trips"
 _azure_cache: dict[tuple[int, int], str] = {}
 _AZURE_LIST_TTL = 3600.0
 _azure_cache_expires = 0.0
+# Federation runs the source builders from a threadpool, so the module-level
+# cache is touched concurrently. This lock guards the expiry check + eviction +
+# read/write so two threads can't race on `_azure_cache_expires`.
+_azure_cache_lock = threading.Lock()
 
 
 def _azure_first_part_url(year: int, month: int) -> str:
@@ -78,14 +83,14 @@ def _azure_first_part_url(year: int, month: int) -> str:
     sql_tools delta cache).
     """
     global _azure_cache_expires
-    now = time.time()
-    if now >= _azure_cache_expires:
-        _azure_cache.clear()
-        _azure_cache_expires = now + _AZURE_LIST_TTL
-
     key = (year, month)
-    if key in _azure_cache:
-        return _azure_cache[key]
+    with _azure_cache_lock:
+        now = time.time()
+        if now >= _azure_cache_expires:
+            _azure_cache.clear()
+            _azure_cache_expires = now + _AZURE_LIST_TTL
+        if key in _azure_cache:
+            return _azure_cache[key]
 
     prefix = f"yellow/puYear={year}/puMonth={month}/part"
     api = (
@@ -100,26 +105,106 @@ def _azure_first_part_url(year: int, month: int) -> str:
             f"Azure: no parquet blob found for puYear={year}/puMonth={month}"
         )
     url = f"{_AZURE_ENDPOINT}/{_AZURE_CONTAINER}/{m.group(1)}"
-    _azure_cache[key] = url
+    with _azure_cache_lock:
+        _azure_cache[key] = url
     return url
+
+
+# -- Credential redaction (for any SQL that leaves the process) ----------------
+
+def redact_sql(sql: str) -> str:
+    """Mask credentials embedded in generated table-function SQL.
+
+    chDB's ``postgresql()`` and ``remoteSecure()`` take the password as a
+    positional string argument, so the generated SQL literally contains the
+    secret. That SQL is surfaced to the LLM and to traces via the tools' ``sql``
+    field — this scrubs the password before it ever leaves the process.
+
+        postgresql('host:port','db','table','user','PASSWORD')  → …,'***')
+        remoteSecure('host:port','table','user','PASSWORD')     → …,'***')
+    """
+    sql = re.sub(
+        r"(postgresql\(\s*(?:'[^']*'\s*,\s*){4}')[^']*(')",
+        r"\1***\2", sql, flags=re.IGNORECASE,
+    )
+    sql = re.sub(
+        r"(remoteSecure\(\s*(?:'[^']*'\s*,\s*){3}')[^']*(')",
+        r"\1***\2", sql, flags=re.IGNORECASE,
+    )
+    return sql
 
 
 # -- ClickHouse Cloud credential resolution -----------------------------------
 
-def chc_credentials() -> dict | None:
-    """Resolve ClickHouse Cloud connection details from the environment.
+# Resolved ClickHouse Cloud creds are cached once (they don't change per process);
+# guarded so concurrent federation threads resolve SSM at most once.
+_chc_ssm_cache: dict | None = None
+_chc_ssm_lock = threading.Lock()
+_CHC_SSM_PREFIX = "/clickhouse"
 
-    Returns None when no password is configured, so the federation tool can
-    silently omit the warehouse leg (graceful absence — same posture as the
-    optional AGENTCORE_MEMORY_ID / LANGFUSE_* wiring). Host is derived from
-    CLICKHOUSE_URL with the scheme stripped; remoteSecure() uses the native
-    secure port (9440), not the HTTPS interface port.
+
+def _chc_from_ssm() -> dict | None:
+    """Resolve ClickHouse Cloud creds from SSM /clickhouse/* (cached).
+
+    Mirrors scripts/graduation_demo.py: URL/USER are plain String params, the
+    password is a SecureString (WithDecryption). The SSM region is
+    CLICKHOUSE_SSM_REGION (the params may live in a different region than the
+    compute — e.g. the MicroVM runs in us-west-2 but the params are in us-east-1),
+    falling back to the standard AWS region vars. Best-effort: any failure
+    (no perms, missing param, no network) returns None so the warehouse leg is
+    skipped rather than breaking federation.
+    """
+    global _chc_ssm_cache
+    with _chc_ssm_lock:
+        if _chc_ssm_cache is not None:
+            return _chc_ssm_cache
+        region = (
+            os.getenv("CLICKHOUSE_SSM_REGION")
+            or os.getenv("AWS_REGION")
+            or os.getenv("AWS_DEFAULT_REGION")
+            or "us-east-1"
+        )
+        try:
+            import boto3
+
+            ssm = boto3.client("ssm", region_name=region)
+
+            def _param(name: str, *, decrypt: bool = False) -> str:
+                resp = ssm.get_parameter(
+                    Name=f"{_CHC_SSM_PREFIX}/{name}", WithDecryption=decrypt
+                )
+                return (resp["Parameter"]["Value"] or "").strip()
+
+            url = _param("CLICKHOUSE_URL")
+            user = _param("CLICKHOUSE_USER") or "default"
+            pwd = _param("CLICKHOUSE_PASSWORD", decrypt=True)
+        except Exception:  # noqa: BLE001 — SSM unavailable → skip the leg
+            return None
+        if not url or not pwd:
+            return None
+        _chc_ssm_cache = {"url": url, "user": user, "pwd": pwd}
+        return _chc_ssm_cache
+
+
+def chc_credentials() -> dict | None:
+    """Resolve ClickHouse Cloud connection details from the environment or SSM.
+
+    Prefers CLICKHOUSE_* env vars; when absent, falls back to SSM /clickhouse/*
+    (same source as scripts/graduation_demo.py) so a deployed agent with only an
+    IAM role — no baked secrets — can still reach the warehouse. Returns None
+    when neither yields a password, so the federation tool omits the warehouse
+    leg (graceful absence — same posture as optional AGENTCORE_MEMORY_ID /
+    LANGFUSE_* wiring). Host is derived from CLICKHOUSE_URL with the scheme
+    stripped; remoteSecure() uses the native secure port (9440).
     """
     raw_host = os.getenv("CLICKHOUSE_URL", "").strip()
     user = os.getenv("CLICKHOUSE_USER", "default").strip()
     pwd = os.getenv("CLICKHOUSE_PASSWORD", "").strip()
     if not raw_host or not pwd:
-        return None
+        resolved = _chc_from_ssm()
+        if resolved is None:
+            return None
+        raw_host, user, pwd = resolved["url"], resolved["user"], resolved["pwd"]
     host = re.sub(r"^https?://", "", raw_host).rstrip("/")
     return {"host": host, "port": _CHC_NATIVE_PORT, "user": user, "password": pwd}
 

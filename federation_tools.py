@@ -36,12 +36,17 @@ import threading
 import time
 
 from chdb import session as _chs
-from datastore.connection import Connection
 from strands import tool
 
 import db
-from db import DB_PATH
-from cloud_sources import FARE_FLOOR, Source, pg_config, resolve_sources
+from db import DB_PATH, chdb_connection
+from cloud_sources import (
+    FARE_FLOOR,
+    Source,
+    pg_config,
+    redact_sql,
+    resolve_sources,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +227,53 @@ def _write_cache(sig: str, rows: list[dict]) -> None:
     )
 
 
+def _annotate(payload: dict, notes: list[str], unavailable: list[str]) -> dict:
+    """Attach the resilience annotations (skipped clouds + free-text notes)."""
+    if unavailable:
+        payload["sources_unavailable"] = unavailable
+    if notes:
+        payload["notes"] = notes
+    return payload
+
+
+def _cache_hit_payload(cached: list[dict], used: list[str], elapsed_ms: float,
+                       union_sql: str) -> dict:
+    """Payload for the materialized-cache fast path (millisecond re-query)."""
+    return {
+        "data": cached,
+        "row_count": len(cached),
+        "mode": "local cache (materialized)",
+        "sources_used": used,
+        "elapsed_ms": elapsed_ms,
+        "sql": redact_sql(union_sql),
+        "source": (
+            "Served from a local chDB MergeTree (nyc_taxi.fleet_cache) — a "
+            "materialized prior federation across " + ", ".join(used) + ". "
+            "Re-queried in-process via chDB SQL (archive-on-compressed); "
+            "pass refresh=true to re-federate."
+        ),
+    }
+
+
+def _fresh_payload(rows: list[dict], mode: str, used: list[str],
+                   elapsed_ms: float, union_sql: str) -> dict:
+    """Payload for the cross-cloud reach path (federated + materialized)."""
+    return {
+        "data": rows,
+        "row_count": len(rows),
+        "mode": mode,
+        "sources_used": used,
+        "elapsed_ms": elapsed_ms,
+        "sql": redact_sql(union_sql),
+        "source": (
+            "One chDB statement federated across " + ", ".join(used) + " — "
+            "NYC TLC yellow-taxi tipping by year, each year read from the cloud "
+            "where it natively lives (S3, Azure, GCS, ClickHouse Cloud, local). "
+            "Result materialized into a local chDB MergeTree for instant re-query."
+        ),
+    }
+
+
 @tool
 def analyze_fleet_across_clouds(sources: str = "", refresh: bool = False) -> str:
     """Federate a decade of NYC taxi tipping across S3, Azure, GCS and ClickHouse Cloud.
@@ -249,7 +301,9 @@ def analyze_fleet_across_clouds(sources: str = "", refresh: bool = False) -> str
     Returns:
         JSON string: {"data": [...per-year rows...], "row_count": N, "mode": ...,
         "sources_used": [...], "elapsed_ms": N, "sql": "<the federated SQL>",
-        "source": "...", and optional "notes": [...]}.
+        "source": "..."}. When a cloud is unreachable the leg is skipped rather
+        than failing the whole query, and the skipped clouds are reported in
+        "sources_unavailable": [...] (with detail in "notes": [...]).
     """
     srcs = resolve_sources(_split_keys(sources))
     fragments, notes = _build_fragments(srcs)
@@ -258,6 +312,8 @@ def analyze_fleet_across_clouds(sources: str = "", refresh: bool = False) -> str
             "no federation sources available (all legs skipped): " + "; ".join(notes)
         )
 
+    built_keys = {s.key for s, _ in fragments}
+    unavailable = [s.cloud_label for s in srcs if s.key not in built_keys]
     used = [s.cloud_label for s, _ in fragments]
     sig = ",".join(sorted(s.key for s, _ in fragments))
     union_sql = _assemble_union(fragments)
@@ -270,52 +326,23 @@ def analyze_fleet_across_clouds(sources: str = "", refresh: bool = False) -> str
         cached = _read_cache(sig)
         elapsed_ms = round((time.time() - t0) * 1000, 1)
         if cached:
-            payload = {
-                "data": cached,
-                "row_count": len(cached),
-                "mode": "local cache (materialized)",
-                "sources_used": used,
-                "elapsed_ms": elapsed_ms,
-                "sql": union_sql,
-                "source": (
-                    "Served from a local chDB MergeTree (nyc_taxi.fleet_cache) — a "
-                    "materialized prior federation across " + ", ".join(used) + ". "
-                    "Re-queried in-process via chDB SQL (archive-on-compressed); "
-                    "pass refresh=true to re-federate."
-                ),
-            }
-            if notes:
-                payload["notes"] = notes
-            return json.dumps(payload)
+            payload = _cache_hit_payload(cached, used, elapsed_ms, union_sql)
+            return json.dumps(_annotate(payload, notes, unavailable))
 
-    # Cross-cloud reach — one federated statement via stateless chDB query.
+    # Cross-cloud reach — one federated statement via the long-lived session.
     t0 = time.time()
     rows, mode = _federate(fragments)
     elapsed_ms = round((time.time() - t0) * 1000, 1)
 
     # Materialize into the local chDB MergeTree for instant re-query.
+    notes = list(notes)  # copy: don't mutate the caller's list
     try:
         _write_cache(sig, rows)
     except Exception as exc:  # noqa: BLE001 — caching is best-effort
         notes.append(f"cache write skipped: {exc}")
 
-    payload = {
-        "data": rows,
-        "row_count": len(rows),
-        "mode": mode,
-        "sources_used": used,
-        "elapsed_ms": elapsed_ms,
-        "sql": union_sql,
-        "source": (
-            "One chDB statement federated across " + ", ".join(used) + " — "
-            "NYC TLC yellow-taxi tipping by year, each year read from the cloud "
-            "where it natively lives (S3, Azure, GCS, ClickHouse Cloud, local). "
-            "Result materialized into a local chDB MergeTree for instant re-query."
-        ),
-    }
-    if notes:
-        payload["notes"] = notes
-    return json.dumps(payload)
+    payload = _fresh_payload(rows, mode, used, elapsed_ms, union_sql)
+    return json.dumps(_annotate(payload, notes, unavailable))
 
 
 # -- Zone enrichment: local chDB trips JOIN PostgreSQL zone lookup ------------
@@ -368,21 +395,17 @@ def analyze_zone_tipping(year: int = 2024, top_n: int = 10) -> str:
     top_n = max(1, min(int(top_n), 100))
     sql = _build_zone_sql(year, top_n)
 
-    conn = Connection(database=DB_PATH)
-    conn.connect()
-    try:
+    with chdb_connection(DB_PATH) as conn:
         t0 = time.time()
         df = conn.execute(sql, output_format="Dataframe").to_df()
         elapsed_ms = round((time.time() - t0) * 1000, 1)
-    finally:
-        conn.close()
 
     rows = _rows_from_df(df)
     return json.dumps({
         "data": rows,
         "row_count": len(rows),
         "elapsed_ms": elapsed_ms,
-        "sql": sql,
+        "sql": redact_sql(sql),
         "source": (
             f"One chDB statement joining local baked NYC taxi trips ({year}) to a "
             "PostgreSQL taxi-zone lookup (postgresql() table function) — top "

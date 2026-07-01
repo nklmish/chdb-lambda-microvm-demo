@@ -15,6 +15,15 @@ import pytest
 import cloud_sources as cs
 
 
+@pytest.fixture(autouse=True)
+def _disable_ssm_fallback(monkeypatch):
+    """Unit tests must never reach real SSM. Disable the /clickhouse/* fallback
+    by default (and clear the resolved-cred cache); tests that exercise the SSM
+    path re-enable it explicitly."""
+    monkeypatch.setattr(cs, "_chc_ssm_cache", None)
+    monkeypatch.setattr(cs, "_chc_from_ssm", lambda: None)
+
+
 # ─── allow-list ───
 
 def test_default_sources_are_all_keys():
@@ -213,3 +222,80 @@ def test_full_multicloud_federation_smoke():
     assert {"2015", "2018"}.issubset(eras)
     for r in out["data"]:
         assert r["avg_tip_pct"] > 0
+
+
+# ─── credential redaction (secrets must never leave the process in `sql`) ───
+
+def test_redact_sql_masks_postgres_password():
+    sql = ("SELECT * FROM postgresql('h:5432', 'nyctaxi', 'taxi_zones', "
+           "'taxiuser', 'sup3rSecretPW')")
+    out = cs.redact_sql(sql)
+    assert "sup3rSecretPW" not in out
+    assert "postgresql('h:5432', 'nyctaxi', 'taxi_zones', 'taxiuser', '***')" in out
+
+
+def test_redact_sql_masks_remote_secure_password():
+    sql = "remoteSecure('host:9440', 'workshop.nyc_taxi_trips', 'default', 'chPass123')"
+    out = cs.redact_sql(sql)
+    assert "chPass123" not in out
+    assert "remoteSecure('host:9440', 'workshop.nyc_taxi_trips', 'default', '***')" in out
+
+
+def test_redact_sql_leaves_credential_free_sql_untouched():
+    sql = "SELECT * FROM nyc_taxi.yellow_trips WHERE fare_amount > 10 LIMIT 5"
+    assert cs.redact_sql(sql) == sql
+
+
+def test_zone_sql_password_is_redacted_in_returned_sql(monkeypatch):
+    """The exact _build_zone_sql shape must match the redaction regex, so the
+    password never appears in the JSON the tool hands back to the LLM."""
+    import federation_tools as ft
+    monkeypatch.setenv("POSTGRES_PASSWORD", "pgSecretPW")
+    raw = ft._build_zone_sql(year=2024, top_n=5)
+    assert "pgSecretPW" in raw                       # raw SQL carries the secret
+    assert "pgSecretPW" not in cs.redact_sql(raw)    # redaction removes it
+
+
+# ─── resilience: skipped legs are reported, not silently dropped ───
+
+def test_federation_reports_unavailable_sources(db_env, sample_db, monkeypatch):
+    """A missing ClickHouse Cloud leg is skipped (not fatal) and surfaced in
+    `sources_unavailable` — the federation story stays honest about coverage."""
+    import db
+    import federation_tools as ft
+    monkeypatch.setattr(db, "DB_PATH", sample_db)
+    monkeypatch.setattr(ft, "DB_PATH", sample_db)
+    for k in ("CLICKHOUSE_URL", "CLICKHOUSE_PASSWORD"):
+        monkeypatch.delenv(k, raising=False)
+
+    out = json.loads(ft.analyze_fleet_across_clouds(sources="local,chc", refresh=True))
+    assert out["sources_used"] == ["local (chDB)"]
+    assert out["sources_unavailable"] == ["ClickHouse Cloud"]
+    assert "notes" in out and any("ClickHouse Cloud" in n for n in out["notes"])
+
+
+# ─── ClickHouse Cloud creds: SSM fallback ───
+
+def test_chc_credentials_from_ssm_when_env_absent(monkeypatch):
+    """With no env vars, creds resolve from SSM /clickhouse/* and normalize to
+    the native-secure remoteSecure() shape."""
+    for k in ("CLICKHOUSE_URL", "CLICKHOUSE_USER", "CLICKHOUSE_PASSWORD"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(cs, "_chc_from_ssm", lambda: {
+        "url": "https://xyz.eu-central-1.aws.clickhouse.cloud",
+        "user": "default", "pwd": "sekret"})
+    assert cs.chc_credentials() == {
+        "host": "xyz.eu-central-1.aws.clickhouse.cloud",
+        "port": "9440", "user": "default", "password": "sekret",
+    }
+
+
+def test_env_creds_take_precedence_over_ssm(monkeypatch):
+    """Explicit env vars win over the SSM fallback."""
+    monkeypatch.setenv("CLICKHOUSE_URL", "https://env.clickhouse.cloud")
+    monkeypatch.setenv("CLICKHOUSE_PASSWORD", "envpw")
+    monkeypatch.setattr(cs, "_chc_from_ssm",
+                        lambda: {"url": "https://ssm", "user": "u", "pwd": "ssmpw"})
+    cfg = cs.chc_credentials()
+    assert cfg["host"] == "env.clickhouse.cloud"
+    assert cfg["password"] == "envpw"

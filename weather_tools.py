@@ -26,10 +26,9 @@ import json
 import logging
 import os
 
-from datastore.connection import Connection
 from strands import tool
 
-from db import DB_PATH
+from db import chdb_connection
 
 logger = logging.getLogger(__name__)
 
@@ -167,13 +166,9 @@ GROUP BY w.weather_category
 ORDER BY w.weather_category ASC
 """.strip()
 
-    # Execute via Connection — consistent with DB_PATH binding.
-    conn = Connection(database=DB_PATH)
-    conn.connect()
-    try:
+    # Execute via the shared chDB connection helper (bound to DB_PATH).
+    with chdb_connection() as conn:
         result_df = conn.execute(sql, output_format="Dataframe").to_df()
-    finally:
-        conn.close()
 
     rows = result_df.to_dict(orient="records")
     source = (
