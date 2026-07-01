@@ -171,10 +171,23 @@ python scripts/chdb_memory_demo.py
   into the local chDB store), `suspend-microvm` (no charge), then `resume-microvm` and get the
   same answer from the on-disk cache in milliseconds.
 - **Fleet fan-out** — N MicroVMs, each with its own private chDB, answering the same question
-  concurrently (no shared database to overload):
+  concurrently (no shared database to overload). Because every VM baked chDB from the *same*
+  image, all N return the *same* number — a live **consensus / snapshot-fidelity** check:
   ```bash
+  # headless (prints a table): fleet size, ready-time, latency, answer, consensus
   python scripts/microvm_fleet_demo.py --count 5 --region us-west-2
+
+  # OR a live browser view of the same fan-out — a grid of cards updating in real time,
+  # with a wall-clock headline and a consensus badge (open http://localhost:8080):
+  python scripts/fleet_console.py --region us-west-2
   ```
+  ![Fleet console: 5 MicroVMs answering concurrently, 5/5 agree](docs/screenshots/fleet_console.png)
+
+  All 5 answered in the wall-clock time of a *single* answer (they ran in parallel with nothing
+  to contend on), and all five private chDB stores returned the identical `690932` — **5/5 agree**.
+  Both front-ends share one tested core ([`fleet_core.py`](fleet_core.py)); the console
+  orchestrates the fleet server-side (auth tokens never reach the browser) and *always* tears the
+  fleet down when the run ends.
 - **Zero-refactor graduation to ClickHouse Cloud** — the *same* analytical SQL served from a
   local chDB table, then from ClickHouse Cloud via `remoteSecure()` — only the view's source
   changes:
