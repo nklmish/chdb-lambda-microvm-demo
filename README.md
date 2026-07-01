@@ -19,6 +19,29 @@ launch partner for Lambda MicroVMs; this repo shows why the two fit together.
 
 ---
 
+## See it in action
+
+The single-file chat UI streams every answer, shows **which tool ran and how long it took**
+(coloured by data plane — blue = in-process chDB, green = S3, amber = cross-cloud), turns
+**Send** into **Stop** so you can cancel a slow query, and — for the federation tool — lights
+up **every cloud the one SQL statement reaches**. The shots below are that UI driven live
+against the agent running on an **AWS Lambda MicroVM** (9.5M baked rows, via
+[`scripts/microvm_ui_proxy.py`](scripts/microvm_ui_proxy.py)):
+
+| The agent, live | One SQL, five clouds |
+|---|---|
+| ![Info panel showing engine, row count and status](docs/screenshots/welcome.png) | ![Federating across five clouds in one statement](docs/screenshots/federation_chip.png) |
+| Engine, row count and health read straight from the running MicroVM. | The federation tool reaching **local chDB + AWS S3 + Azure + GCS + ClickHouse Cloud** in a single statement — the **Stop** button cancels a query mid-flight. |
+
+![Answers with per-tool latency waterfalls](docs/screenshots/federation.png)
+
+*Every answer carries a per-tool latency waterfall. Here: the in-process baked query (blue)
+returns in under a second, the NOAA-weather S3 join (green) in ~0.6s, and the decade-long
+cross-cloud tipping federation (amber) — served from its materialized local cache after the
+first reach — in milliseconds. **"Federate to reach, localize to think."***
+
+---
+
 ## Why in-process data
 
 An agent is a loop: plan → call a tool → read the result → reason → repeat, often 5–20 tool
@@ -55,7 +78,11 @@ charge), and resumed with state intact.
 The federation tool reads from remote sources, then **materializes the result into the local
 chDB store** so the next identical question is served in milliseconds — *federate to reach,
 localize to think*. Sources are an allow-list vetted in
-[`cloud_sources.py`](cloud_sources.py); the model never supplies a URL or a credential.
+[`cloud_sources.py`](cloud_sources.py); the model never supplies a URL or a credential, and
+any credentials the generated SQL must carry (e.g. `postgresql()` / `remoteSecure()`) are
+redacted before that SQL is returned to the model or a trace. If one cloud is unreachable the
+leg is skipped rather than failing the whole query, and the skipped clouds are reported back
+in a `sources_unavailable` field.
 
 > Note: `query_with_fresh_data` and the live-delta path depend on the public NYC TLC
 > CloudFront CDN. The agent reads it with a browser User-Agent to avoid WAF throttling, but
@@ -129,6 +156,15 @@ python scripts/chdb_memory_demo.py
 
 **On AWS:**
 
+- **Drive the deployed MicroVM from your browser** — serve the chat UI locally and proxy every
+  request (real SSE passthrough) to a running MicroVM, so the browser talks to the AWS agent.
+  This is how the [screenshots above](#see-it-in-action) were captured:
+  ```bash
+  # ids come from what scripts/deploy_microvm.py printed
+  python scripts/microvm_ui_proxy.py \
+    --microvm-id microvm-xxxx --endpoint xxxx.lambda-microvm.us-west-2.on.aws --region us-west-2
+  # then open http://localhost:8080
+  ```
 - **Snapshot-hot start** — the first analytical query after `RunMicrovm` is warm because
   `/ready` gated the snapshot on chDB being loaded (`scripts/deploy_microvm.py` verify step).
 - **The agent brain that suspends and resumes** — federate a decade of tipping (materialized
@@ -172,9 +208,12 @@ curl -s localhost:8080/chat -H 'Content-Type: application/json' \
   -d '{"text":"What is the busiest hour of the day? One sentence."}'
 ```
 
-The FastAPI app warms chDB at startup, so the first query is served from a loaded store. A
-single-file chat UI is served at `http://localhost:8080/`. (Skip the bake and the app starts
-fine but `/health` reports `unhealthy` and `/chat` errors until data exists.)
+The FastAPI app warms chDB at startup — both the taxi table and the agent-memory tables, so
+the first query is served from a fully loaded store with no lazy-load contention. A
+single-file chat UI is served at `http://localhost:8080/`; it streams the answer, shows a
+per-tool latency waterfall (coloured by data plane), and turns **Send** into **Stop** while a
+query is in flight. (Skip the bake and the app starts fine but `/health` reports `unhealthy`
+and `/chat` errors until data exists.)
 
 ## Claude Code skills
 
@@ -205,7 +244,7 @@ belong in `.env.local` (git-ignored) or AWS SSM — never commit them.
 | `CHDB_DATA_PATH` | yes | Path to the baked chDB store |
 | `MICROVM_HOOKS_PORT` | no (9000) | Lifecycle-hook port (Lambda MicroVMs) |
 | `WEATHER_MOUNT_PATH` | no | S3 Files NFS mount path; falls back to direct `s3()` if absent |
-| `CLICKHOUSE_URL` / `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` | no | ClickHouse Cloud federation leg (skipped if unset) |
+| `CLICKHOUSE_URL` / `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` | no | ClickHouse Cloud federation leg. Falls back to SSM `/clickhouse/*` (region: `CLICKHOUSE_SSM_REGION`) when unset — so a deployed MicroVM reaches the warehouse via its IAM role with no baked secrets. Leg is skipped only if neither yields creds. |
 | `POSTGRES_*` | no | PostgreSQL zone-lookup leg for `analyze_zone_tipping` |
 | `AGENTCORE_MEMORY_ID` | no | Cross-session AgentCore Memory; agent is stateless without it |
 | `LANGFUSE_*` / `OTEL_EXPORTER_OTLP_*` | no | Observability; trace export is disabled when no endpoint is configured |

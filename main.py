@@ -139,6 +139,17 @@ def _warm_chdb() -> None:
     except Exception as e:  # noqa: BLE001 — warm-up must never break startup
         logger.warning("chDB warm-up skipped: %s", e)
 
+    # Also pre-load the agent_state memory tables. Streaming runs tools on a
+    # threadpool while the memory layer loads these on the request thread; if
+    # they first load concurrently, the process-global embedded server can hit
+    # `recursive_mutex lock failed (ASYNC_LOAD_WAIT_FAILED)`. Loading each once
+    # here (single-threaded) means the first real request finds them ready.
+    for table in ("agent_state.conversations", "agent_state.analysis_log"):
+        try:
+            query_records(f"SELECT 1 FROM {table} LIMIT 1")
+        except Exception as e:  # noqa: BLE001 — best-effort; never break startup
+            logger.warning("memory-table warm-up skipped (%s): %s", table, e)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

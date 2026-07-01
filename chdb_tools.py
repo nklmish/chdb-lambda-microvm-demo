@@ -60,8 +60,7 @@ def analyze_taxi_data(
     Returns:
         JSON string with data array and row count.
     """
-    from datastore.connection import Connection
-    from db import DB_PATH
+    from db import chdb_connection
     from query_helpers import (
         ALLOWED_COLUMNS,
         AGG_MAP,
@@ -197,12 +196,8 @@ def analyze_taxi_data(
     limit = max(1, min(int(limit), 1000))
     sql += f" LIMIT {limit}"
 
-    conn = Connection(database=DB_PATH)
-    conn.connect()
-    try:
+    with chdb_connection() as conn:
         df = conn.execute(sql, output_format="Dataframe").to_df()
-    finally:
-        conn.close()
 
     rows = df.to_dict(orient="records")
     return json.dumps({"data": rows, "row_count": len(rows)})

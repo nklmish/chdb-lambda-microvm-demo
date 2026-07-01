@@ -479,7 +479,7 @@
                 <dt>Engine:</dt><dd>chDB (embedded ClickHouse)</dd>
                 <dt>Rows:</dt><dd id="infoRows">loading...</dd>
                 <dt>Status:</dt><dd id="infoStatus">checking...</dd>
-                <dt>Version:</dt><dd id="infoVersion">3.0.0</dd>
+                <dt>Version:</dt><dd id="infoVersion">…</dd>
             </dl>
             <div style="margin-top:8px">
                 <a href="/docs" style="color:var(--accent);text-decoration:none;font-size:12px">API Docs (Swagger)</a>
@@ -492,8 +492,8 @@
                 <div class="suggestions" id="suggestions">
                     <button class="suggestion-chip" tabindex="0">Average fare in Manhattan?</button>
                     <button class="suggestion-chip" tabindex="0">Busiest hour of the day?</button>
-                    <button class="suggestion-chip" tabindex="0">Compare avg fares from 2024 baked data vs latest 2026 fresh data</button>
-                    <button class="suggestion-chip" tabindex="0">Any new trips after Dec 2025? Check fresh NYC TLC data</button>
+                    <button class="suggestion-chip" tabindex="0">Compare average fares: baked historical vs latest fresh TLC data</button>
+                    <button class="suggestion-chip" tabindex="0">Are there any trips past the baked cutoff? Check fresh NYC TLC data</button>
                     <button class="suggestion-chip" tabindex="0">Do rainy days have more taxi trips?</button>
                     <button class="suggestion-chip" tabindex="0">How does temperature affect taxi fares?</button>
                 </div>
@@ -525,6 +525,8 @@
 
         let isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
         let isSending = false;
+        let activeController = null;   // in-flight fetch, so the Stop button can abort it
+        let userStopped = false;       // distinguishes a user Stop from a timeout
 
         // Federation tools render a richer chip showing the data planes they
         // span — green = local/in-process, amber = cross-cloud reach (Fig 1/2).
@@ -548,6 +550,15 @@
             },
         };
 
+        // Map a tool to a timing-bar colour category. Green (s3)/amber (cdn)
+        // echo the federation chip's local-vs-cloud language; blue = in-process.
+        function toolCategory(name) {
+            if (name === 'analyze_weather_impact') return 's3_fetch';
+            if (name === 'query_with_fresh_data') return 'cdn_fetch';
+            if (name === 'analyze_fleet_across_clouds' || name === 'analyze_zone_tipping') return 'cdn_fetch';
+            return 'db_query';
+        }
+
         // ── Theme ──────────────────────────────────
         function applyTheme() {
             document.body.classList.toggle('dark', isDark);
@@ -565,13 +576,22 @@
             infoPanel.classList.toggle('visible');
         });
 
+        // /health carries status + row_count (the field the backend actually
+        // returns); /info carries the app version. Keep them separate so a
+        // rename on one endpoint can't blank the other.
         fetch('/health').then(r => r.json()).then(data => {
+            const rows = data.row_count;
             document.getElementById('infoRows').textContent =
-                data.rows_available ? data.rows_available.toLocaleString() : 'unknown';
+                (typeof rows === 'number') ? rows.toLocaleString() : 'unknown';
             document.getElementById('infoStatus').textContent = data.status || 'unknown';
-            document.getElementById('infoVersion').textContent = data.version || '?';
         }).catch(() => {
             document.getElementById('infoStatus').textContent = 'unavailable';
+        });
+
+        fetch('/info').then(r => r.json()).then(data => {
+            document.getElementById('infoVersion').textContent = data.version || '?';
+        }).catch(() => {
+            document.getElementById('infoVersion').textContent = '?';
         });
 
         // ── Auto-resize textarea ───────────────────
@@ -681,6 +701,24 @@
             // summary line showing per-tool counts and durations.
             bubble.querySelectorAll('.tool-chip').forEach(el => el.remove());
 
+            // Per-tool latency waterfall, built from the durations measured
+            // client-side on the SSE tool start/end events (real data — the
+            // server never emits a timing stream). Only render when we timed
+            // at least one tool.
+            if (toolStats && Object.keys(toolStats).length) {
+                const entries = Object.entries(toolStats)
+                    .filter(([, s]) => s.totalMs > 0)
+                    .map(([name, s]) => ({
+                        label: name,
+                        elapsed_ms: Math.round(s.totalMs),
+                        category: toolCategory(name),
+                    }));
+                if (entries.length) {
+                    const total = entries.reduce((a, e) => a + e.elapsed_ms, 0);
+                    bubble.appendChild(renderTimingPanel(entries, total));
+                }
+            }
+
             const footer = document.createElement('div');
             footer.className = 'metrics-footer';
             const parts = [];
@@ -699,7 +737,8 @@
                 toolLine.className = 'metrics-footer';
                 toolLine.style.marginTop = '2px';
                 const summary = Object.entries(toolStats)
-                    .map(([name, s]) => '<span>🛠 ' + name + ' ×' + s.count + '</span>')
+                    .map(([name, s]) => '<span>🛠 ' + name + ' ×' + s.count +
+                        (s.totalMs > 0 ? ' · ' + Math.round(s.totalMs) + 'ms' : '') + '</span>')
                     .join('');
                 toolLine.innerHTML = summary;
                 bubble.appendChild(toolLine);
@@ -769,7 +808,8 @@
             if (!text || isSending) return;
 
             isSending = true;
-            sendBtn.disabled = true;
+            userStopped = false;
+            sendBtn.textContent = 'Stop';   // keep enabled so it can cancel
             inputEl.disabled = true;
 
             appendMessage('user', text);
@@ -781,6 +821,7 @@
             messagesEl.scrollTop = messagesEl.scrollHeight;
 
             const controller = new AbortController();
+            activeController = controller;
             const timeout = setTimeout(() => controller.abort(), 120000);
 
             try {
@@ -867,9 +908,6 @@
                                 const chips = bubble.querySelectorAll('.tool-chip[data-tool-name="' + name + '"]:not(.done)');
                                 if (chips.length > 0) chips[chips.length - 1].classList.add('done');
                             }
-                        } else if (payload.type === 'timing') {
-                            bubble.appendChild(renderTimingPanel(payload.entries, payload.total_ms));
-                            messagesEl.scrollTop = messagesEl.scrollHeight;
                         } else if (payload.type === 'error') {
                             throw new Error(payload.content);
                         } else if (payload.type === 'done') {
@@ -883,20 +921,35 @@
             } catch (err) {
                 clearTimeout(timeout);
                 typingEl.classList.remove('visible');
-                const msg = err.name === 'AbortError'
-                    ? 'The query took too long. Try a simpler question.'
-                    : err.message;
-                appendMessage('error', msg);
+                if (err.name === 'AbortError') {
+                    // User-initiated stop leaves the partial answer as-is; only a
+                    // real timeout surfaces an error bubble.
+                    if (!userStopped) {
+                        appendMessage('error', 'The query took too long. Try a simpler question.');
+                    }
+                } else {
+                    appendMessage('error', err.message);
+                }
             } finally {
                 isSending = false;
+                activeController = null;
+                userStopped = false;
                 sendBtn.disabled = false;
+                sendBtn.textContent = 'Send';
                 inputEl.disabled = false;
                 inputEl.focus();
             }
         }
 
         // ── Event listeners ────────────────────────
-        sendBtn.addEventListener('click', () => sendMessage(inputEl.value));
+        sendBtn.addEventListener('click', () => {
+            if (isSending) {              // acting as a Stop button
+                userStopped = true;
+                if (activeController) activeController.abort();
+                return;
+            }
+            sendMessage(inputEl.value);
+        });
 
         inputEl.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {

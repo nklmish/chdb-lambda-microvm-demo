@@ -24,13 +24,13 @@ Design (Q1–Q7 synthesis):
 from __future__ import annotations
 import json
 import os
+import threading
 import time
 
 from chdb.datastore import DataStore
-from datastore.connection import Connection
 from strands import tool
 
-from db import DB_PATH, get_taxi_ds
+from db import chdb_connection, get_taxi_ds
 from query_helpers import parse_filters, parse_groupby, parse_aggregations
 
 
@@ -57,7 +57,10 @@ cdn_base = "https://d37ci6vzurychx.cloudfront.net/trip-data"
 DELTA_FETCH_USER_AGENT = "Mozilla/5.0 (compatible; NYC-Taxi-Agent/1.0)"
 
 # Module-level cache: {"months": ["2026-01", "2026-02"], "expires": 1713280000.0}
+# Guarded by _delta_cache_lock: delta discovery can run from a threadpool, so the
+# check-then-update of this shared dict must be atomic.
 _delta_cache: dict = {"months": [], "expires": 0.0}
+_delta_cache_lock = threading.Lock()
 _CACHE_TTL_SECONDS = 3600  # 1 hour
 
 
@@ -91,11 +94,8 @@ def _get_delta_df(month: str) -> "pd.DataFrame":
         f"headers('User-Agent'='{DELTA_FETCH_USER_AGENT}')) "
         "SETTINGS max_memory_usage = 12000000000"
     )
-    conn = Connection(database=DB_PATH)
-    conn.connect()
-    df = conn.execute(sql, output_format="Dataframe").to_df()
-    conn.close()
-    return df
+    with chdb_connection() as conn:
+        return conn.execute(sql, output_format="Dataframe").to_df()
 
 
 def _filter_df_via_sql(df: "pd.DataFrame", filters_str: str) -> "pd.DataFrame":
@@ -107,20 +107,15 @@ def _filter_df_via_sql(df: "pd.DataFrame", filters_str: str) -> "pd.DataFrame":
     """
     if not filters_str.strip():
         return df
-    # Build a simple SELECT * WHERE <filters> SQL.
-    # parse_filters uses the same filter syntax, so we can translate directly.
-    # For simplicity, use the Connection.query_df path which uses Python() table function
-    # on the existing DB_PATH connection.
-    conn = Connection(database=DB_PATH)
-    conn.connect()
-    # Build WHERE clause from filters_str (same syntax as parse_filters).
-    # Replace AND separator with SQL AND.
+    # Build a simple SELECT * WHERE <filters> SQL. parse_filters uses the same
+    # filter syntax, so we translate directly and run it through query_df on a
+    # connection bound to DB_PATH (reusing the existing EmbeddedServer rather
+    # than seeding a new one at ':memory:').
     import re
     where_clause = re.sub(r'\bAND\b', 'AND', filters_str, flags=re.IGNORECASE)
     sql = f"SELECT * FROM __df__ WHERE {where_clause}"
-    result = conn.query_df(sql, df, "__df__")
-    conn.close()
-    return result
+    with chdb_connection() as conn:
+        return conn.query_df(sql, df, "__df__")
 
 
 def _apply_groupby_agg_pandas(
@@ -199,8 +194,9 @@ def _apply_groupby_agg_pandas(
 def _discover_delta_months() -> list[str]:
     """Probe CDN for available Parquet months after DELTA_START. Cache results for 1 hour."""
     now = time.time()
-    if _delta_cache["months"] and now < _delta_cache["expires"]:
-        return _delta_cache["months"]
+    with _delta_cache_lock:
+        if _delta_cache["months"] and now < _delta_cache["expires"]:
+            return _delta_cache["months"]
 
     delta_start = os.getenv("DELTA_START", "2026-01")
     start_year, start_month = int(delta_start[:4]), int(delta_start[5:7])
@@ -216,9 +212,7 @@ def _discover_delta_months() -> list[str]:
     # Parquet footer + first row group, so each probe is cheap (~0.3s). Using the
     # fetch's own client keeps discovery and fetch consistent — a month that probes
     # OK is one the fetch can actually read.
-    conn = Connection(database=DB_PATH)
-    conn.connect()
-    try:
+    with chdb_connection() as conn:
         while consecutive_misses < 3:
             probe = f"{year}-{month:02d}"
             url = f"{cdn_base}/yellow_tripdata_{probe}.parquet"
@@ -236,11 +230,10 @@ def _discover_delta_months() -> list[str]:
             if month > 12:
                 month = 1
                 year += 1
-    finally:
-        conn.close()
 
-    _delta_cache["months"] = found
-    _delta_cache["expires"] = now + _CACHE_TTL_SECONDS
+    with _delta_cache_lock:
+        _delta_cache["months"] = found
+        _delta_cache["expires"] = now + _CACHE_TTL_SECONDS
     return found
 
 

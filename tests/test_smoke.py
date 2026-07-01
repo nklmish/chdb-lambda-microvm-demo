@@ -33,3 +33,14 @@ def test_data_profile_fixture_writes_json(data_profile):
         profile = json.load(f)
     assert profile["row_count"] == 10
     assert profile["baked_cutoff"] == "2024-12-31"
+
+
+def test_chdb_connection_yields_connected_and_closes(sample_db):
+    """The shared context manager connects, runs a query, and closes cleanly."""
+    from db import chdb_connection
+    with chdb_connection(sample_db) as conn:
+        df = conn.execute(
+            "SELECT count() AS c FROM nyc_taxi.yellow_trips",
+            output_format="Dataframe",
+        ).to_df()
+    assert int(df["c"][0]) == 10

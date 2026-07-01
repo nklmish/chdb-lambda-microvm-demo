@@ -51,6 +51,11 @@ BEDROCK_MODEL_ID = os.getenv(
 )
 BEDROCK_REGIONS = ("us-east-1", "us-east-2", "us-west-2")
 
+# Region holding the ClickHouse Cloud credential params (/clickhouse/*). The
+# federation warehouse leg resolves these from SSM at runtime (cloud_sources.py),
+# so nothing secret is baked into the image. Override with CLICKHOUSE_SSM_REGION.
+CLICKHOUSE_SSM_REGION = os.getenv("CLICKHOUSE_SSM_REGION", "us-east-1")
+
 # Files/dirs never shipped in the build artifact: secrets, local data, scratch,
 # build outputs, and anything irrelevant to the runtime image.
 EXCLUDE_DIRS = {
@@ -222,6 +227,29 @@ def _exec_role_policy(account: str, region: str) -> str:
                     ],
                     "Resource": model_arns + profile_arns,
                 },
+                {
+                    # Federation warehouse leg: read ClickHouse Cloud creds from
+                    # SSM /clickhouse/* at runtime (least-privilege; no baked
+                    # secrets). Harmless when the params don't exist — the app's
+                    # SSM fallback is best-effort and just skips the CHC leg.
+                    "Sid": "ReadClickHouseCreds",
+                    "Effect": "Allow",
+                    "Action": ["ssm:GetParameter", "ssm:GetParameters"],
+                    "Resource": (
+                        f"arn:aws:ssm:{CLICKHOUSE_SSM_REGION}:{account}:parameter/clickhouse/*"
+                    ),
+                },
+                {
+                    "Sid": "DecryptClickHouseSecret",
+                    "Effect": "Allow",
+                    "Action": ["kms:Decrypt"],
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "kms:ViaService": f"ssm.{CLICKHOUSE_SSM_REGION}.amazonaws.com"
+                        }
+                    },
+                },
             ],
         }
     )
@@ -389,11 +417,13 @@ def _image_arn(name: str, account: str, region: str) -> str:
 
 
 def _env_vars(region: str) -> str:
-    """Baked-in runtime env — keeps the demo self-contained (no SSM/Langfuse).
+    """Baked-in runtime env — no secrets (no Langfuse creds, no ClickHouse creds).
 
     Bedrock region must match where model access is enabled; tracing exporters are
     off so the agent needs no Langfuse credentials. The execution-role creds reach
-    the guest via IMDSv2, so no AWS keys are baked in.
+    the guest via IMDSv2, so no AWS keys are baked in. The ClickHouse Cloud
+    federation leg resolves its creds from SSM /clickhouse/* at runtime (via the
+    exec role), so only the SSM *region* is passed here — never the credentials.
     """
     # NB: AWS_REGION / AWS_DEFAULT_REGION are RESERVED keys (rejected by
     # create-microvm-image). The region the guest's IMDS reports is used by the
@@ -406,6 +436,9 @@ def _env_vars(region: str) -> str:
             "CHDB_DATA_PATH": "/app/local_chdb_data",
             "MICROVM_HOOKS_PORT": "9000",
             "IS_PROD": "false",
+            # Where the federation warehouse leg looks up ClickHouse Cloud creds
+            # (SSM /clickhouse/*) — may differ from the compute region.
+            "CLICKHOUSE_SSM_REGION": CLICKHOUSE_SSM_REGION,
             "OTEL_TRACES_EXPORTER": "none",
             "OTEL_METRICS_EXPORTER": "none",
             "DISABLE_ADOT_OBSERVABILITY": "true",
