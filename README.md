@@ -28,7 +28,7 @@ up **every cloud the one SQL statement reaches**. The shots below are that UI dr
 against the agent running on an **AWS Lambda MicroVM** (9.5M baked rows, via
 [`scripts/microvm_ui_proxy.py`](scripts/microvm_ui_proxy.py)):
 
-| The agent, live | One SQL, five clouds |
+| The agent, live | One SQL, multi clouds |
 |---|---|
 | ![Info panel showing engine, row count and status](docs/screenshots/welcome.png) | ![Federating across five clouds in one statement](docs/screenshots/federation_chip.png) |
 | Engine, row count and health read straight from the running MicroVM. | The federation tool reaching **local chDB + AWS S3 + Azure + GCS + ClickHouse Cloud** in a single statement — the **Stop** button cancels a query mid-flight. |
