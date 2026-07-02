@@ -137,6 +137,72 @@ the app (a secret guard refuses to ship any `.env*` except `.env.example`), buil
 MicroVM image with lifecycle hooks, runs a MicroVM, and verifies `/ping → /health → /chat`
 over the dedicated HTTPS endpoint.
 
+## Serverless distributed scan — a ClickHouse workload with no cluster
+
+> *"ClickHouse Cloud is where your data lives, chDB is what your agent thinks with, and
+> Lambda MicroVMs is where it gets to think — in private."*
+
+The same architecture that gives one agent a private engine scales sideways into an
+**ephemeral, shared-nothing distributed query engine**: launch N Firecracker microVMs — each a
+private chDB — suspend the fleet to **$0**, resume it snapshot-hot, then **scatter** shards of a
+huge dataset at each VM's `/scan`, and **gather** the mergeable partials. The nodes don't exist
+until the query arrives and are gone seconds later, billed per second — no cluster, no ingestion.
+The headline dataset is **Overture Maps buildings — ~2.5 billion rows**, read straight from
+[its public S3 bucket](https://registry.opendata.aws/overture/) in-region: **nothing is copied
+or staged.** (The dataset picker also offers the global road network, or a private lake of your own.)
+
+**This is not a race against ClickHouse Cloud.** On raw throughput a warehouse wins; this is
+the shape Cloud *can't* be — per-request-isolated, **$0 compute at rest**, spun up on demand.
+Use Cloud when data is persistent, shared, and always-on; use chDB-on-MicroVMs when compute is
+**bursty, per-tenant-isolated, and should cost nothing at rest**. One query plane, two runtimes.
+
+![Serverless distributed scan console — 50 microVMs scanning ~2.5B Overture buildings](docs/screenshots/scan_console.png)
+
+*One run in the live console (`scripts/scan_console.py`): 50 private chDB engines scanned
+**2,494,158,734 Overture buildings in ~54 s for $0.70**, cluster at **$0 at rest** — with the
+"not a benchmark" disclaimer up top, the merged building-type answer, and each engine's ~140 MB/s.
+The `#0 ERROR` card is a straggler — expected in any single run; the answer merges the other 49.*
+
+To make it tangible, here's roughly what one run looked like on AWS (`us-west-2`, image config
+2 GB RAM; ~2 vCPU assumed — the API doesn't expose the vCPU allocation). **Treat these as
+illustrative, order-of-magnitude figures — not a benchmark:** single-shot, no warm-up, no repeated
+trials, no controlled network; they move run to run.
+
+| Dataset | Rows | Fleet | Wall-clock | Throughput | Cost / run | At rest |
+|---|---|---|---|---|---|---|
+| **Overture buildings** (public S3) | ~2.5 B | 50 microVMs | ~54 s | ~46 M rows/s | ~$0.70 | **$0 compute** |
+| Overture road network (public S3) | ~0.3 B | 30 microVMs | ~10 s | ~30 M rows/s | ~$0.30 | **$0 compute** |
+| private NYC-taxi lake | ~0.8 B | 50 microVMs | ~8 s | ~100 M rows/s | ~$0.55 | **$0 compute** |
+
+The point isn't the exact figure — it's the **shape**: **~2.5 billion buildings scanned by 50
+ephemeral Firecracker chDB engines in under a minute, for ~70 cents**, with the cluster at **$0
+compute when idle** (only ~$0.01/hr of snapshot storage). Per-run cost is dominated by snapshot
+resume/suspend; compute is a few cents. The claims that *are* robust — not run-dependent — are
+the economics (**$0 at rest, per-second billing**), the **per-request Firecracker isolation**, and
+reading **S3 directly with no ingestion**. And the merged answer is a real analytical result — the
+global building-type mix (house ≫ residential ≫ detached ≫ garage ≫ apartments ≫ …).
+
+What a rigorous benchmark would add — and we deliberately haven't — is warm-up passes, repeated
+trials with p50/p95, a pinned vCPU/memory shape, and a controlled network. So rather than trust a
+table, the console above runs it live. Two honest scaling notes it makes visible: throughput
+scales **sub-linearly** (per-VM S3 setup dominates small shards), and fleet resume is
+**rate-limited** (`ResumeMicrovm` ~5/s) — waking a large fleet from $0 takes tens of seconds, not
+milliseconds.
+
+Reproduce it (needs the deployed image; the Overture data is public, so there's nothing to stage):
+
+```bash
+python scripts/scan_console.py --region us-west-2                              # live console → http://localhost:8080
+python scripts/scan_demo.py --dataset buildings --count 50 --region us-west-2  # headless: prints the run's metrics
+python scripts/scan_demo.py --dataset segments  --count 30 --region us-west-2  # the global road network instead
+python scripts/stage_lake.py --region us-west-2   # optional: stage a private NYC-taxi lake, then --dataset taxi
+```
+
+Both the console and the CLI share one tested core ([`fleet_core.py`](fleet_core.py)); the worker
+is a raw, LLM-free `/scan` endpoint ([`scan_tools.py`](scan_tools.py)) that reads public datasets
+anonymously and private ones with the microVM's own least-privilege role (creds via IMDS, never in
+the SQL), building every S3 URL from a vetted registry — no arbitrary URL or bucket crosses the wire.
+
 ## Demos
 
 Each demo backs a specific claim. The first set needs only `pip install`; the rest need AWS

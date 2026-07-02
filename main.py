@@ -76,6 +76,15 @@ class ChatResponse(BaseModel):
     timings: Optional[list[dict]] = None
 
 
+class ScanRequest(BaseModel):
+    # Vetted shard: an allow-listed dataset key + parquet basenames (+ release for
+    # the Overture datasets). scan_tools builds every S3 URL from a baked registry,
+    # so no arbitrary URL/SQL (or bucket) crosses the wire.
+    dataset: str = "taxi"
+    release: Optional[str] = None
+    files: list[str] = Field(..., min_length=1, max_length=600)
+
+
 class InvocationRequest(BaseModel):
     prompt: Optional[str] = None
     text: Optional[str] = None  # AgentCore sends either field
@@ -315,6 +324,24 @@ async def invocations(request: Request, body: InvocationRequest) -> ChatResponse
         request_id=getattr(request.state, "request_id", str(uuid.uuid4())),
         timings=result.get("timings"),
     )
+
+
+@app.post("/scan")
+async def scan(request: Request, body: ScanRequest) -> JSONResponse:
+    """Raw chDB analytical scan over this MicroVM's shard of the S3 cold lake.
+
+    No LLM — this is the distributed-scan worker path. Returns a mergeable
+    per-year partial plus engine-reported scan volume (rows/bytes read), so the
+    coordinator can gather partials across the fleet and merge them.
+    """
+    from scan_tools import run_scan
+    try:
+        result = run_scan(body.dataset, body.release, body.files)
+        return JSONResponse(result)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(status_code=500, content={"error": str(e)[:200]})
 
 
 @app.get("/info")
