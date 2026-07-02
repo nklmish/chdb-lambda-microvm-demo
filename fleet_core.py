@@ -151,8 +151,14 @@ def wait_ready(vm: dict, region: str, timeout_s: float = 180) -> dict:
     return vm
 
 
-def ask(vm: dict, question: str, timeout: float = 120) -> dict:
-    """Fire the question at a ready VM; records chat_ms, answer, fingerprint."""
+def ask(vm: dict, question: str, timeout: float = 120,
+        max_answer_chars: int = 200) -> dict:
+    """Fire the question at a ready VM; records chat_ms, answer, fingerprint.
+
+    max_answer_chars caps the stored answer for display: the consensus demo needs
+    only the one-line count (200), but the agentic fan-out asks multi-part
+    sub-questions whose answers run longer, so it passes a larger cap.
+    """
     if not vm.get("token"):
         vm["answer"] = "(never became ready)"
         vm["chat_ms"] = None
@@ -163,7 +169,7 @@ def ask(vm: dict, question: str, timeout: float = 120) -> dict:
         _, body = call(vm["endpoint"], "/chat", vm["token"], method="POST",
                        body={"text": question}, timeout=timeout)
         answer = json.loads(body).get("response", "")
-        vm["answer"] = answer[:200]
+        vm["answer"] = answer[:max_answer_chars]
         vm["fingerprint"] = fingerprint(answer)
     except Exception as e:  # noqa: BLE001
         vm["answer"] = f"(error: {str(e)[:80]})"
@@ -636,3 +642,256 @@ def _try(fn, *a):
         return fn(*a)
     except Exception:  # noqa: BLE001
         return None
+
+
+# ── Agentic fan-out: decompose one question → per-VM sub-questions → synthesize ─
+#
+# A different pattern from consensus (same question at every VM) and the scan
+# (split the *data*): here a coordinator decomposes ONE high-level question into
+# distinct SUB-questions, fans a *different* sub-question at each MicroVM's agent
+# (every VM holds the same complete private chDB, so each answers a different
+# analytical facet correctly), then synthesizes the partials into one briefing.
+#
+# plan_subquestions/synthesize keep the DECISION logic pure and injectable: the
+# LLM planner+synthesizer are passed in (a Bedrock CLI call in production), so the
+# fallback ladder — curated → LLM → raw question — is testable without AWS.
+
+# A broad, multi-faceted question whose curated decomposition maps each sub-question
+# onto a distinct tool the worker agent already has (hour / zone tips / payment /
+# weather) — so every card exercises a different analytical path. The console sends
+# this verbatim as its default, which is what triggers the curated (always-green) plan.
+AGENTIC_DEFAULT_QUESTION = (
+    "Give me a rush-hour operations briefing for NYC yellow taxi: when is demand "
+    "highest, where do drivers earn the best tips, how do riders pay, and how does "
+    "weather change ridership?"
+)
+
+CURATED_PLANS: dict[str, list[str]] = {
+    AGENTIC_DEFAULT_QUESTION: [
+        "What is the single busiest pickup hour of the day by trip count? "
+        "Answer in one short sentence and include the exact trip count.",
+        "Which pickup zones have the highest revenue-weighted tip rate? "
+        "Answer in one short sentence naming the top zone, its borough, and its tip rate.",
+        "What is the split of trips by payment type (credit card vs cash)? "
+        "Answer in one short sentence with the percentage for each.",
+        "How does rain change ridership compared with dry days? "
+        "Answer in one short sentence and cite the NOAA LaGuardia weather source.",
+    ],
+}
+
+
+def curated_plan(question: str) -> list[str] | None:
+    """The hand-authored decomposition for a known question, else None.
+
+    Returned as a fresh copy so callers can slice/mutate without touching the
+    registry.
+    """
+    plan = CURATED_PLANS.get(question)
+    return list(plan) if plan else None
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    """Trim, drop blanks, and de-duplicate preserving first-seen order."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for it in items:
+        s = (it or "").strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def plan_subquestions(question: str, n: int, *, planner=None) -> list[str]:
+    """Decompose `question` into 1..n distinct sub-questions.
+
+    Ladder: a curated plan for a known question wins (always green for the demo);
+    otherwise an injected `planner(question, n) -> list[str]` LLM decomposes it;
+    if that yields fewer than two usable sub-questions (or raises), fall back to
+    fanning the raw question — a safe, visible degradation rather than a failure.
+    The result is capped to `n` (the requested fleet size).
+    """
+    cap = max(1, int(n))
+    curated = curated_plan(question)
+    if curated:
+        return curated[:cap]
+    if planner is not None:
+        try:
+            subs = _dedupe(list(planner(question, cap)))
+            if len(subs) >= 2:
+                return subs[:cap]
+        except Exception:  # noqa: BLE001 — planner is best-effort; fall back below
+            pass
+    return [question]
+
+
+def synthesize_template(question: str, vms: list[dict]) -> str:
+    """Deterministic reduce: fold each answered sub-question into one briefing.
+
+    Skips VMs whose answer is an error/never-ready marker (those start with "(").
+    Used as the always-available fallback when no LLM synthesizer is provided or
+    the LLM call fails.
+    """
+    parts: list[str] = []
+    for vm in vms:
+        sq = (vm.get("subquestion") or "").strip()
+        ans = (vm.get("answer") or "").strip()
+        if sq and ans and not ans.startswith("("):
+            parts.append(f"• {sq}\n  {ans}")
+    if not parts:
+        return "No sub-answers were produced by the fleet."
+    return f"Combined briefing — {question}\n\n" + "\n\n".join(parts)
+
+
+def synthesize(question: str, vms: list[dict], *, synthesizer=None) -> str:
+    """Combine the fleet's per-sub-question answers into a final response.
+
+    Uses an injected `synthesizer(question, vms) -> str` (an LLM reduce) when
+    given and it returns non-empty text; otherwise (or on error) uses the
+    deterministic template.
+    """
+    if synthesizer is not None:
+        try:
+            out = synthesizer(question, vms)
+            if out and out.strip():
+                return out.strip()
+        except Exception:  # noqa: BLE001 — fall back to the deterministic template
+            pass
+    return synthesize_template(question, vms)
+
+
+# ── Coordinator LLM via the AWS CLI (no boto/chDB dependency in this module) ────
+
+DEFAULT_COORDINATOR_MODEL = "us.anthropic.claude-sonnet-4-20250514-v1:0"
+
+
+def _bedrock_converse(prompt: str, region: str, model_id: str, *,
+                      max_tokens: int = 1024, timeout: float = 60) -> str:
+    """One text-in/text-out turn via `aws bedrock-runtime converse`.
+
+    Kept CLI-only so fleet_core stays boto-free and account-agnostic, matching
+    the rest of the module.
+    """
+    messages = json.dumps([{"role": "user", "content": [{"text": prompt}]}])
+    inference = json.dumps({"maxTokens": max_tokens, "temperature": 0.2})
+    out = subprocess.run(
+        ["aws", "bedrock-runtime", "converse", "--model-id", model_id,
+         "--messages", messages, "--inference-config", inference,
+         "--region", region],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    if out.returncode != 0:
+        raise RuntimeError((out.stderr or "converse failed").strip()[:200])
+    data = json.loads(out.stdout)
+    return data["output"]["message"]["content"][0]["text"].strip()
+
+
+def bedrock_planner(region: str, model_id: str = DEFAULT_COORDINATOR_MODEL):
+    """Build an injectable planner that asks Bedrock to decompose a question into
+    N sub-questions, returned as a JSON array of strings."""
+    def planner(question: str, n: int) -> list[str]:
+        prompt = (
+            f"Decompose this analytical question about an NYC yellow-taxi dataset "
+            f"into at most {n} independent sub-questions that can each be answered "
+            f"on its own. Each sub-question must stand alone and target a distinct "
+            f"facet. Reply with ONLY a JSON array of strings.\n\nQuestion: {question}"
+        )
+        text = _bedrock_converse(prompt, region, model_id)
+        start, end = text.find("["), text.rfind("]")
+        if start == -1 or end == -1:
+            return []
+        parsed = json.loads(text[start:end + 1])
+        return [str(s) for s in parsed if isinstance(s, str)]
+    return planner
+
+
+def bedrock_synthesizer(region: str, model_id: str = DEFAULT_COORDINATOR_MODEL):
+    """Build an injectable synthesizer that folds the fleet's sub-answers into one
+    coherent briefing via Bedrock."""
+    def synthesizer(question: str, vms: list[dict]) -> str:
+        findings = "\n\n".join(
+            f"Sub-question: {vm.get('subquestion','')}\nAnswer: {vm.get('answer','')}"
+            for vm in vms
+            if (vm.get("answer") or "").strip() and not (vm.get("answer") or "").startswith("(")
+        )
+        if not findings:
+            return ""
+        prompt = (
+            f"You are combining independent findings from a fleet of agents, each of "
+            f"which answered one sub-question about an NYC yellow-taxi dataset. Write a "
+            f"concise briefing (a few sentences) that answers the overall question, "
+            f"citing the concrete numbers from the findings. Do not invent numbers.\n\n"
+            f"Overall question: {question}\n\nFindings:\n{findings}"
+        )
+        return _bedrock_converse(prompt, region, model_id, max_tokens=800)
+    return synthesizer
+
+
+def run_agentic_fleet_blocking(question: str, region: str, name: str, *,
+                               count: int = 4, on_event=None, keep: bool = False,
+                               planner=None, synthesizer=None) -> dict:
+    """Plan → launch → wait → ask (a *different* sub-question per VM) → synthesize
+    → (terminate) an agentic fleet, emitting on_event(dict) at each milestone.
+
+    on_event receives dicts with a "type": preflight | launch | ready | plan |
+    answer | synthesis | done | terminated | error. Termination is guaranteed in
+    `finally` unless keep=True, even if a later phase raises.
+    """
+    def emit(ev: dict) -> None:
+        if on_event:
+            on_event(ev)
+
+    plan = plan_subquestions(question, clamp_count(count), planner=planner)
+    n = len(plan)
+    launched: list[dict] = []
+    try:
+        acct = account(region)
+        img = image_arn(acct, region, name)
+        exe = exec_role_arn(acct)
+        version = newest_ready_version(img, region)
+        emit({"type": "preflight", "n": n, "version": version, "region": region,
+              "question": question, "plan": plan})
+
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            launched = list(ex.map(
+                lambda i: run_one(i, img, version, exe, region), range(n)))
+        emit({"type": "launch",
+              "vms": [{"idx": vm["idx"], "id": vm["id"]} for vm in launched]})
+
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            for fut in [ex.submit(wait_ready, vm, region) for vm in launched]:
+                vm = fut.result()
+                emit({"type": "ready", "idx": vm["idx"], "ready_s": vm["ready_s"]})
+
+        for vm, sq in zip(launched, plan):
+            vm["subquestion"] = sq
+        emit({"type": "plan",
+              "items": [{"idx": vm["idx"], "subquestion": vm["subquestion"]}
+                        for vm in launched]})
+
+        wall0 = time.time()
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            futures = [ex.submit(ask, vm, vm["subquestion"], 120, 600)
+                       for vm in launched]
+            for fut in futures:
+                vm = fut.result()
+                emit({"type": "answer", "idx": vm["idx"], "chat_ms": vm["chat_ms"],
+                      "subquestion": vm.get("subquestion", ""),
+                      "answer": vm.get("answer", "")})
+        wall_ms = round((time.time() - wall0) * 1000)
+
+        final = synthesize(question, launched, synthesizer=synthesizer)
+        emit({"type": "synthesis", "text": final})
+
+        ok = sum(1 for vm in launched if vm.get("chat_ms"))
+        summary = {"type": "done", "wall_ms": wall_ms, "ok": ok, "total": n,
+                   "synthesis": final}
+        emit(summary)
+        return summary
+    except Exception as e:  # noqa: BLE001 — surface, then always clean up
+        emit({"type": "error", "message": str(e)})
+        return {"type": "error", "message": str(e)}
+    finally:
+        if not keep and launched:
+            terminate_all(launched, region)
+            emit({"type": "terminated", "ids": [vm["id"] for vm in launched]})

@@ -254,6 +254,28 @@ python scripts/chdb_memory_demo.py
   Both front-ends share one tested core ([`fleet_core.py`](fleet_core.py)); the console
   orchestrates the fleet server-side (auth tokens never reach the browser) and *always* tears the
   fleet down when the run ends.
+- **Agentic fan-out** — the same fleet, but instead of *one* question at every VM, a coordinator
+  **decomposes one high-level question into distinct sub-questions** and hands a *different* one to
+  each MicroVM's agent. Every VM holds the same complete private chDB, so each answers a different
+  facet (busiest hour / best-tipping zone / payment mix / weather impact) in parallel — then the
+  coordinator **synthesizes** the partial answers into one briefing. This is map-reduce over the
+  *question* (versus consensus, which splits nothing, and the distributed scan, which splits the
+  *data*):
+  ```bash
+  # live browser view: one card per sub-question, then a synthesized briefing (open http://localhost:8080)
+  python scripts/agentic_console.py --region us-west-2
+  ```
+  ![Agentic fan-out console: 4 MicroVMs each answering a different sub-question, then one synthesized briefing](docs/screenshots/agentic_console.png)
+
+  *One live run:* the coordinator split the briefing into four sub-questions and fanned one at each
+  MicroVM — busiest hour (**6 PM, 690,932 trips**), best-tipping zone (**zone 48, 18.0%**), payment
+  mix (**76% card / 14% cash**), and rain's effect on ridership (**~40% more, per NOAA LaGuardia**) —
+  all answered **concurrently in 38 s wall-clock** against four *independent* private chDB engines,
+  then folded into a single briefing. The default question uses a curated, always-green
+  decomposition; **edit the question** and the coordinator LLM (Bedrock) plans a fresh decomposition
+  live, with a safe fallback to fanning the raw question if planning fails. Same tested core
+  ([`fleet_core.py`](fleet_core.py)), server-side orchestration (auth tokens never reach the
+  browser), and guaranteed teardown as the consensus console.
 - **Zero-refactor graduation to ClickHouse Cloud** — the *same* analytical SQL served from a
   local chDB table, then from ClickHouse Cloud via `remoteSecure()` — only the view's source
   changes:
