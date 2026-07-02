@@ -131,3 +131,108 @@ def test_median():
     assert fc._median([3, 1, 2]) == 2
     assert fc._median([4, 1, 2, 3]) == 2.5
     assert fc._median([None, None]) is None
+
+
+# ── Agentic fan-out: decompose one question → per-VM sub-questions → synthesize ─
+#
+# The plan/synthesize DECISION logic is pure and unit-tested here; the LLM planner
+# and synthesizer are injected callables (a Bedrock CLI call in production), so the
+# fallback ladder — curated → LLM → raw question — is exercised offline.
+
+
+def test_curated_plan_returns_distinct_subquestions_for_default():
+    plan = fc.curated_plan(fc.AGENTIC_DEFAULT_QUESTION)
+    assert plan is not None
+    assert len(plan) >= 3
+    assert len(set(plan)) == len(plan)          # all sub-questions distinct
+
+
+def test_curated_plan_none_for_unknown_question():
+    assert fc.curated_plan("how many trips were there in 2024?") is None
+
+
+def test_plan_subquestions_uses_curated_for_default_and_truncates_to_n():
+    full = fc.curated_plan(fc.AGENTIC_DEFAULT_QUESTION)
+    got = fc.plan_subquestions(fc.AGENTIC_DEFAULT_QUESTION, 2)
+    assert got == full[:2]                       # capped to the requested fleet size
+
+
+def test_plan_subquestions_uses_injected_planner_for_custom_question():
+    def planner(question, n):
+        return ["sub A", "sub B", "sub C"][:n]
+    got = fc.plan_subquestions("some novel question", 3, planner=planner)
+    assert got == ["sub A", "sub B", "sub C"]
+
+
+def test_plan_subquestions_dedupes_and_strips_planner_output():
+    def planner(question, n):
+        return ["  keep one  ", "keep one", "keep two", "", "   "]
+    got = fc.plan_subquestions("q", 5, planner=planner)
+    assert got == ["keep one", "keep two"]       # trimmed, de-duplicated, blanks dropped
+
+
+def test_plan_subquestions_falls_back_to_raw_when_planner_returns_too_few():
+    def planner(question, n):
+        return ["only one"]                       # < 2 distinct → not a real decomposition
+    got = fc.plan_subquestions("q", 4, planner=planner)
+    assert got == ["q"]
+
+
+def test_plan_subquestions_falls_back_to_raw_when_planner_raises():
+    def planner(question, n):
+        raise RuntimeError("bedrock unavailable")
+    got = fc.plan_subquestions("q", 4, planner=planner)
+    assert got == ["q"]
+
+
+def test_plan_subquestions_no_planner_custom_question_is_raw():
+    assert fc.plan_subquestions("q", 4) == ["q"]
+
+
+# ── synthesize (reduce) ──
+
+def _answered(idx, subq, answer):
+    return {"idx": idx, "subquestion": subq, "answer": answer, "chat_ms": 900}
+
+
+def test_synthesize_template_combines_answered_subquestions():
+    vms = [_answered(0, "busiest hour?", "6 PM with 690,932 trips."),
+           _answered(1, "best tipping zone?", "JFK at 22%.")]
+    out = fc.synthesize_template("briefing", vms)
+    assert "busiest hour?" in out and "690,932" in out
+    assert "best tipping zone?" in out and "JFK" in out
+
+
+def test_synthesize_template_skips_error_and_empty_answers():
+    vms = [_answered(0, "busiest hour?", "6 PM with 690,932 trips."),
+           _answered(1, "broken?", "(error: timeout)"),
+           _answered(2, "never?", "(never became ready)")]
+    out = fc.synthesize_template("briefing", vms)
+    assert "690,932" in out
+    assert "error" not in out and "never became ready" not in out
+
+
+def test_synthesize_template_handles_no_usable_answers():
+    vms = [_answered(0, "broken?", "(error: timeout)")]
+    out = fc.synthesize_template("briefing", vms)
+    assert isinstance(out, str) and out            # non-empty, no crash
+
+
+def test_synthesize_uses_injected_synthesizer_when_available():
+    vms = [_answered(0, "q1", "a1"), _answered(1, "q2", "a2")]
+    out = fc.synthesize("briefing", vms, synthesizer=lambda q, v: "LLM briefing")
+    assert out == "LLM briefing"
+
+
+def test_synthesize_falls_back_to_template_when_synthesizer_raises():
+    vms = [_answered(0, "q1", "answer one"), _answered(1, "q2", "answer two")]
+    def boom(q, v):
+        raise RuntimeError("bedrock down")
+    out = fc.synthesize("briefing", vms, synthesizer=boom)
+    assert "answer one" in out and "answer two" in out
+
+
+def test_synthesize_falls_back_to_template_when_synthesizer_empty():
+    vms = [_answered(0, "q1", "answer one")]
+    out = fc.synthesize("briefing", vms, synthesizer=lambda q, v: "   ")
+    assert "answer one" in out
