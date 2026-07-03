@@ -280,6 +280,28 @@ def _exec_role_policy(account: str, region: str) -> str:
                     },
                 },
                 {
+                    # Zone-tipping federation: read the Aurora Postgres app creds
+                    # from SSM /postgres/* (in THIS region — same as the fleet) at
+                    # runtime. Harmless when absent (the leg degrades gracefully).
+                    "Sid": "ReadPostgresCreds",
+                    "Effect": "Allow",
+                    "Action": ["ssm:GetParameter", "ssm:GetParameters"],
+                    "Resource": (
+                        f"arn:aws:ssm:{region}:{account}:parameter/postgres/*"
+                    ),
+                },
+                {
+                    "Sid": "DecryptPostgresSecret",
+                    "Effect": "Allow",
+                    "Action": ["kms:Decrypt"],
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "kms:ViaService": f"ssm.{region}.amazonaws.com"
+                        }
+                    },
+                },
+                {
                     # Distributed-scan cold lake: read the private yellow-taxi
                     # parquet the MicroVM's chDB s3() scans. Least-privilege —
                     # scoped to this account's artifact bucket's lake/ prefix.
@@ -491,6 +513,9 @@ def _env_vars(region: str, account: str) -> str:
             # Where the federation warehouse leg looks up ClickHouse Cloud creds
             # (SSM /clickhouse/*) — may differ from the compute region.
             "CLICKHOUSE_SSM_REGION": CLICKHOUSE_SSM_REGION,
+            # The Aurora zone-lookup creds (/postgres/*) live in the fleet's own
+            # region (published by scripts/setup_federation.py).
+            "POSTGRES_SSM_REGION": region,
             # Distributed-scan cold lake (private S3, read via the exec role).
             "LAKE_BUCKET": f"nyc-taxi-microvm-artifacts-{account}-{region}",
             "LAKE_PREFIX": "lake/yellow",

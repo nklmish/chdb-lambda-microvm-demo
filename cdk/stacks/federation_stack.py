@@ -60,7 +60,7 @@ class FederationStack(Stack):
         # DB SG: 5432 inbound ONLY from the connector SG (least privilege, no CIDR).
         db_sg = ec2.SecurityGroup(
             self, "AuroraSg", vpc=vpc,
-            description="Aurora Postgres — reachable only from the MicroVM egress connector",
+            description="Aurora Postgres - reachable only from the MicroVM egress connector",
             allow_all_outbound=False)
         db_sg.add_ingress_rule(
             connector_sg, ec2.Port.tcp(5432),

@@ -41,6 +41,22 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse  # n
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _AGENTIC_HTML = os.path.join(_ROOT, "static", "agentic.html")
 
+
+def _resolve_egress_connectors(region: str) -> list[str] | None:
+    """Best-effort SSM lookup of the VPC egress connector the agentic fleet uses to
+    reach the private Aurora zone lookup over native TCP. None when the federation
+    stack isn't deployed — the fleet then runs on default public egress (and the
+    zone-tipping tool degrades gracefully, as before)."""
+    try:
+        import boto3
+
+        ssm = boto3.client("ssm", region_name=region)
+        arn = ssm.get_parameter(
+            Name="/federation/EGRESS_CONNECTOR_ARN")["Parameter"]["Value"].strip()
+        return [arn] if arn else None
+    except Exception:  # noqa: BLE001 — no connector / no perms → public egress
+        return None
+
 # Crash-safety registry: ids launched by a *non-keep* run, terminated on exit if
 # the run didn't finish cleanly (e.g. the server was killed mid-fan-out).
 _live_lock = threading.Lock()
@@ -127,6 +143,10 @@ def build_app(default_region: str, default_name: str,
         # LLM; the default question uses the curated, always-green plan.
         planner = fc.bedrock_planner(region, model_id)
         synthesizer = fc.bedrock_synthesizer(region, model_id)
+        # Route the agentic workers through the VPC egress connector (when the
+        # federation stack is deployed) so their zone-tipping tool can reach the
+        # private Aurora over native TCP.
+        egress_connectors = _resolve_egress_connectors(region)
 
         # Refuse a second concurrent run rather than launch another fleet.
         if not _run_gate.acquire(blocking=False):
@@ -154,7 +174,8 @@ def build_app(default_region: str, default_name: str,
             try:
                 fc.run_agentic_fleet_blocking(
                     q, region, name, count=n, on_event=emit, keep=keep,
-                    planner=planner, synthesizer=synthesizer, tracer=tracer)
+                    planner=planner, synthesizer=synthesizer, tracer=tracer,
+                    egress_connectors=egress_connectors)
             finally:
                 _run_gate.release()
                 loop.call_soon_threadsafe(queue.put_nowait, {"type": "_end"})
