@@ -22,6 +22,7 @@ The OTEL auto-instrumentation for RetrieveMemoryRecords captures only RPC metada
 gen_ai.memory.retrieved_count and gen_ai.memory.retrieved_content so Langfuse shows
 what the agent actually recalled. Wraps in try/except — never breaks the agent.
 """
+import base64
 import json
 import logging
 import os
@@ -30,6 +31,88 @@ from strands.telemetry import StrandsTelemetry
 logger = logging.getLogger(__name__)
 
 _initialized = False
+_langfuse_runtime_configured = False
+
+
+def build_langfuse_otel_env(host: str, public_key: str, secret_key: str) -> dict:
+    """The OTEL + LANGFUSE_* env that turns on trace export to Langfuse Cloud.
+
+    Mirrors the proven EC2 mount-demo recipe: a generic OTLP endpoint (base path —
+    the OTLP SDK appends /v1/traces) and a Basic-auth header carrying the ingestion
+    version. Pure/side-effect-free so it is unit-testable.
+    """
+    host = host.rstrip("/")
+    auth = base64.b64encode(f"{public_key}:{secret_key}".encode()).decode()
+    return {
+        "OTEL_EXPORTER_OTLP_ENDPOINT": f"{host}/api/public/otel",
+        "OTEL_EXPORTER_OTLP_HEADERS": (
+            f"Authorization=Basic {auth},x-langfuse-ingestion-version=4"),
+        "OTEL_TRACES_EXPORTER": "otlp",
+        "LANGFUSE_HOST": host,
+        "LANGFUSE_PUBLIC_KEY": public_key,
+        "LANGFUSE_SECRET_KEY": secret_key,
+    }
+
+
+def configure_langfuse_runtime(region: str | None = None) -> bool:
+    """Post-resume (runtime) Langfuse setup for Lambda MicroVMs. Idempotent.
+
+    Lambda MicroVMs snapshots the container at BUILD time and *resumes* it at
+    run-microvm, so the image CMD runs under the build role — which must not hold
+    prod secrets. Tracing is therefore stood up here instead: in the run/resume
+    lifecycle hook (and, as a backstop, on the first traced request), which run
+    in-process under the *execution* role. We resolve /langfuse/* from SSM, set the
+    OTEL/LANGFUSE env, and attach an OTLP span processor to the *existing* global
+    tracer provider (StrandsTelemetry would try to install a new global provider,
+    which OTEL blocks when opentelemetry-instrument already set one). No secret is
+    ever baked into the image or the snapshot's code artifact.
+
+    Returns True once tracing is configured; best-effort — never raises.
+    """
+    global _langfuse_runtime_configured
+    if _langfuse_runtime_configured:
+        return True
+    if os.getenv("LANGFUSE_RESOLVE_FROM_SSM", "").lower() != "true":
+        return False
+    region = region or os.getenv("LANGFUSE_SSM_REGION", "us-east-1")
+    try:
+        import boto3
+
+        ssm = boto3.client("ssm", region_name=region)
+        host = ssm.get_parameter(Name="/langfuse/LANGFUSE_HOST")["Parameter"]["Value"]
+        pk = ssm.get_parameter(Name="/langfuse/LANGFUSE_PUBLIC_KEY")["Parameter"]["Value"]
+        sk = ssm.get_parameter(
+            Name="/langfuse/LANGFUSE_SECRET_KEY", WithDecryption=True)["Parameter"]["Value"]
+    except Exception as e:  # noqa: BLE001 — no creds/AWS → stay untraced
+        logger.warning("langfuse runtime resolve failed (%s); tracing off", e)
+        return False
+
+    for k, v in build_langfuse_otel_env(host, pk, sk).items():
+        os.environ[k] = v
+
+    try:
+        from opentelemetry import trace
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+        provider = trace.get_tracer_provider()
+        if not hasattr(provider, "add_span_processor"):
+            # No SDK provider yet (e.g. a proxy) — install one now.
+            provider = TracerProvider()
+            trace.set_tracer_provider(provider)
+        # OTLPSpanExporter reads OTEL_EXPORTER_OTLP_ENDPOINT/HEADERS we just set.
+        # This single processor on the global provider is the ONLY export path on
+        # the worker — the agent spans are linked to the caller's trace via explicit
+        # OTEL remote-parent context (agent.run_agent_with_tracing), not the Langfuse
+        # SDK, so there is exactly one export and no duplicate spans.
+        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+        _langfuse_runtime_configured = True
+        logger.info("langfuse runtime tracing configured (region=%s)", region)
+        return True
+    except Exception as e:  # noqa: BLE001 — never break the agent on telemetry setup
+        logger.warning("langfuse runtime exporter setup failed: %s", e)
+        return False
 
 
 def _agentcore_memory_response_hook(span, service_name, operation_name, result):

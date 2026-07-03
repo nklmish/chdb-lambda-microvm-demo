@@ -83,20 +83,38 @@ def _validate() -> bool:
     return ok
 
 
+def _configure_tracing() -> None:
+    """Stand up Langfuse tracing post-resume, under the exec role (best-effort).
+
+    Must happen here (run/resume hook), NOT at container boot: Lambda MicroVMs runs
+    the image CMD at build time under the build role and snapshots the result, so
+    the exec-role SSM lookup for /langfuse/* only works from a runtime hook.
+    """
+    try:
+        from observability import configure_langfuse_runtime
+
+        configure_langfuse_runtime()
+    except Exception as exc:  # noqa: BLE001 — telemetry must never break the run hook
+        logger.info("langfuse runtime config skipped: %s", exc)
+
+
 def _on_run() -> None:
-    """Run-from-snapshot: reseed RNG per snapshot-uniqueness guidance."""
+    """Run-from-snapshot: reseed RNG, then configure Langfuse tracing (exec role)."""
     default_reseed()
+    _configure_tracing()
     logger.info("microvm run hook fired (fresh instance from snapshot)")
 
 
 def _on_resume() -> None:
-    """SUSPENDED -> RUNNING: reseed and note the resume.
+    """SUSPENDED -> RUNNING: reseed, (re)configure tracing, note the resume.
 
     The chDB store (including the federation cache MergeTree) lives on the VM's
     persistent disk and survives suspend/resume untouched, so there is nothing to
-    reload here — the agent brain is already warm. We only reseed RNG.
+    reload here — the agent brain is already warm. We reseed RNG and ensure tracing
+    is configured (idempotent).
     """
     default_reseed()
+    _configure_tracing()
     logger.info("microvm resume hook fired (state restored from suspend)")
 
 

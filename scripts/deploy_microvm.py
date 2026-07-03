@@ -444,8 +444,13 @@ def _hooks_config() -> str:
                 "validateTimeoutInSeconds": 120,
             },
             "microvmHooks": {
-                "run": "ENABLED", "runTimeoutInSeconds": 5,
-                "resume": "ENABLED", "resumeTimeoutInSeconds": 5,
+                # run/resume fire post-snapshot-resume, in-process, under the exec
+                # role — where observability.configure_langfuse_runtime resolves
+                # /langfuse/* from SSM and attaches the OTLP exporter. 30s gives the
+                # cross-region SSM lookups headroom (setup is also idempotently
+                # retried on the first traced request as a backstop).
+                "run": "ENABLED", "runTimeoutInSeconds": 30,
+                "resume": "ENABLED", "resumeTimeoutInSeconds": 30,
                 "suspend": "ENABLED", "suspendTimeoutInSeconds": 10,
                 "terminate": "ENABLED", "terminateTimeoutInSeconds": 10,
             },
@@ -460,11 +465,17 @@ def _image_arn(name: str, account: str, region: str) -> str:
 def _env_vars(region: str, account: str) -> str:
     """Baked-in runtime env — no secrets (no Langfuse creds, no ClickHouse creds).
 
-    Bedrock region must match where model access is enabled; tracing exporters are
-    off so the agent needs no Langfuse credentials. The execution-role creds reach
-    the guest via IMDSv2, so no AWS keys are baked in. The ClickHouse Cloud
-    federation leg resolves its creds from SSM /clickhouse/* at runtime (via the
-    exec role), so only the SSM *region* is passed here — never the credentials.
+    Bedrock region must match where model access is enabled. The execution-role
+    creds reach the guest via IMDSv2, so no AWS keys are baked in. Both the
+    ClickHouse federation leg and Langfuse tracing resolve their creds from SSM at
+    runtime (via the exec role), so only the SSM *regions* are passed here — never
+    the credentials.
+
+    Observability: OTEL_TRACES_EXPORTER stays "none" as the safe default;
+    microvm_boot.py flips it to "otlp" only after it successfully resolves
+    /langfuse/* from SSM (LANGFUSE_RESOLVE_FROM_SSM=true). LANGFUSE_TRACING_ENVIRONMENT
+    is DEV so /invocations links each worker into the coordinator's fan-out trace
+    (run_agent_with_tracing); a failed resolve just boots untraced.
     """
     # NB: AWS_REGION / AWS_DEFAULT_REGION are RESERVED keys (rejected by
     # create-microvm-image). The region the guest's IMDS reports is used by the
@@ -483,7 +494,12 @@ def _env_vars(region: str, account: str) -> str:
             # Distributed-scan cold lake (private S3, read via the exec role).
             "LAKE_BUCKET": f"nyc-taxi-microvm-artifacts-{account}-{region}",
             "LAKE_PREFIX": "lake/yellow",
-            "OTEL_TRACES_EXPORTER": "none",
+            # Observability → Langfuse Cloud. Creds resolved from SSM at boot by
+            # microvm_boot.py (mirrors the /clickhouse/* pattern); no secret baked.
+            "LANGFUSE_RESOLVE_FROM_SSM": "true",
+            "LANGFUSE_SSM_REGION": LANGFUSE_SSM_REGION,
+            "LANGFUSE_TRACING_ENVIRONMENT": "DEV",
+            "OTEL_TRACES_EXPORTER": "none",   # microvm_boot flips to "otlp" on resolve
             "OTEL_METRICS_EXPORTER": "none",
             "DISABLE_ADOT_OBSERVABILITY": "true",
         }
