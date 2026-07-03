@@ -163,7 +163,7 @@ def wait_ready(vm: dict, region: str, timeout_s: float = 180) -> dict:
 
 def ask(vm: dict, question: str, timeout: float = 120,
         max_answer_chars: int = 200, trace_context: dict | None = None,
-        session_id: str | None = None) -> dict:
+        session_id: str | None = None, trace_name: str | None = None) -> dict:
     """Fire the question at a ready VM; records chat_ms, answer, fingerprint.
 
     max_answer_chars caps the stored answer for display: the consensus demo needs
@@ -194,6 +194,8 @@ def ask(vm: dict, question: str, timeout: float = 120,
             path, req = "/chat", {"text": question}
         if session_id:
             req["session_id"] = session_id
+        if trace_name:
+            req["trace_name"] = trace_name
         _, body = call(vm["endpoint"], path, vm["token"], method="POST",
                        body=req, timeout=timeout)
         answer = json.loads(body).get("response", "")
@@ -302,7 +304,8 @@ def run_fleet_blocking(n: int, region: str, name: str, question: str,
 
         wall0 = time.time()
         with ThreadPoolExecutor(max_workers=n) as ex:
-            futures = [ex.submit(ask, vm, question, session_id=sess_id)
+            futures = [ex.submit(ask, vm, question, session_id=sess_id,
+                                 trace_name="consensus-worker")
                        for vm in launched]
             for fut in futures:
                 vm = fut.result()

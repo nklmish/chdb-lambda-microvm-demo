@@ -69,9 +69,11 @@ logger = logging.getLogger(__name__)
 class ChatRequest(BaseModel):
     text: str = Field(..., max_length=10000)
     # Langfuse session grouping: the fleet coordinator passes one session_id per
-    # run so every worker's trace lands grouped in the Sessions view.
+    # run so every worker's trace lands grouped in the Sessions view. trace_name
+    # gives the worker's trace a descriptive name instead of "POST /chat".
     session_id: Optional[str] = None
     user_id: Optional[str] = None
+    trace_name: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -98,6 +100,7 @@ class InvocationRequest(BaseModel):
     parent_span_id: Optional[str] = None
     session_id: Optional[str] = None
     user_id: Optional[str] = None
+    trace_name: Optional[str] = None
 
 
 # --- Per-request memory builder ---------------------------------------------
@@ -233,7 +236,7 @@ async def health() -> JSONResponse:
 async def chat(request: Request, body: ChatRequest) -> ChatResponse:
     init_timing()
     memory = _build_memory(request)
-    with session_scope(body.session_id, body.user_id):
+    with session_scope(body.session_id, body.user_id, body.trace_name):
         result = chat_with_agent(body.text, memory)
     return ChatResponse(
         response=result["response"],
@@ -313,7 +316,7 @@ async def invocations(request: Request, body: InvocationRequest) -> ChatResponse
 
     env = os.getenv("LANGFUSE_TRACING_ENVIRONMENT", "PRD")
     if env in ("DEV", "TST") and body.trace_id:
-        with session_scope(body.session_id, body.user_id):
+        with session_scope(body.session_id, body.user_id, body.trace_name):
             response_text = run_agent_with_tracing(
                 user_input,
                 trace_id=body.trace_id,
@@ -326,7 +329,7 @@ async def invocations(request: Request, body: InvocationRequest) -> ChatResponse
         )
 
     memory = _build_memory(request, default_user="agentcore")
-    with session_scope(body.session_id, body.user_id):
+    with session_scope(body.session_id, body.user_id, body.trace_name):
         result = chat_with_agent(user_input, memory)
     return ChatResponse(
         response=result["response"],

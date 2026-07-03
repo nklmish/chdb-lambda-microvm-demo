@@ -289,8 +289,12 @@ def test_consensus_run_generates_session_and_passes_to_workers(monkeypatch):
     monkeypatch.setattr(fc, "wait_ready",
                         lambda vm, region: {**vm, "ready_s": 1.0, "token": "t"})
 
-    def fake_ask(vm, q, timeout=120, max_answer_chars=200, trace_context=None, session_id=None):
+    seen_names: list = []
+
+    def fake_ask(vm, q, timeout=120, max_answer_chars=200, trace_context=None,
+                 session_id=None, trace_name=None):
         seen_sessions.append(session_id)
+        seen_names.append(trace_name)
         vm["answer"] = "6 PM 690932 trips"
         vm["chat_ms"] = 100
         vm["fingerprint"] = "690932"
@@ -304,6 +308,16 @@ def test_consensus_run_generates_session_and_passes_to_workers(monkeypatch):
     # every worker got the SAME session id → grouped in the Sessions view
     assert set(seen_sessions) == {summary["session_id"]}
     assert len(seen_sessions) == 3
+    # and a descriptive trace name (not "POST /chat")
+    assert set(seen_names) == {"consensus-worker"}
+
+
+def test_ask_includes_trace_name_in_body(monkeypatch):
+    store: dict = {}
+    monkeypatch.setattr(fc, "call", _fake_call_capturing(store))
+    vm = {"idx": 0, "token": "tok", "endpoint": "ep"}
+    fc.ask(vm, "q", session_id="s", trace_name="consensus-worker")
+    assert store["body"]["trace_name"] == "consensus-worker"
 
 
 # ── run_agentic_fleet_blocking stitches the fan-out into one trace tree ──

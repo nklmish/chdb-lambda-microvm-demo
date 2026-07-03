@@ -32,13 +32,16 @@ from strands.telemetry import StrandsTelemetry
 logger = logging.getLogger(__name__)
 
 
-def session_scope(session_id: str | None, user_id: str | None = None):
-    """Best-effort Langfuse session grouping for one request.
+def session_scope(session_id: str | None, user_id: str | None = None,
+                  trace_name: str | None = None):
+    """Best-effort Langfuse session grouping (and trace naming) for one request.
 
-    Returns a context manager that stamps session_id/user_id on the trace produced
-    while the agent runs, so a fleet's worker traces land grouped in the Sessions
-    view. A no-op nullcontext when there's no session_id or Langfuse isn't
-    available — observability must never break request handling.
+    Returns a context manager that stamps session_id/user_id — and, when given, a
+    descriptive trace_name (overriding the "POST /chat" FastAPI auto-span name) — on
+    the trace produced while the agent runs, so a fleet's worker traces land grouped
+    and readable in the Sessions view. A no-op nullcontext when there's no
+    session_id or Langfuse isn't available — observability must never break request
+    handling.
     """
     if not session_id:
         return contextlib.nullcontext()
@@ -48,6 +51,8 @@ def session_scope(session_id: str | None, user_id: str | None = None):
         kwargs = {"session_id": session_id}
         if user_id:
             kwargs["user_id"] = user_id
+        if trace_name:
+            kwargs["trace_name"] = trace_name
         return propagate_attributes(**kwargs)
     except Exception as e:  # noqa: BLE001 — SDK absent/unconfigured → no grouping
         logger.debug("session_scope skipped: %s", e)
