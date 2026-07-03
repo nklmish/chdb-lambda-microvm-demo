@@ -317,7 +317,8 @@ def _stub_aws(monkeypatch, seen_ctx):
     monkeypatch.setattr(fc, "account", lambda region: "123456789012")
     monkeypatch.setattr(fc, "newest_ready_version", lambda img, region: "9.0")
     monkeypatch.setattr(fc, "run_one",
-                        lambda i, img, v, exe, region: {"idx": i, "id": f"vm{i}", "endpoint": "ep"})
+                        lambda i, img, v, exe, region, egress_connectors=None: {
+                            "idx": i, "id": f"vm{i}", "endpoint": "ep"})
 
     def fake_wait(vm, region):
         vm["ready_s"] = 1.0
@@ -358,6 +359,31 @@ def test_agentic_run_stitches_one_trace_and_propagates_context(monkeypatch):
     # every worker was linked to the SAME trace, under DISTINCT parent spans
     assert seen_ctx[0]["trace_id"] == "TRACE" == seen_ctx[1]["trace_id"]
     assert seen_ctx[0]["parent_span_id"] != seen_ctx[1]["parent_span_id"]
+
+
+def test_run_one_omits_egress_connector_by_default(monkeypatch):
+    captured = {}
+    def fake_aws(*args, region, **kw):
+        captured["args"] = args
+        return {"microvmId": "vm0", "endpoint": "ep"}
+    monkeypatch.setattr(fc, "aws", fake_aws)
+    fc.run_one(0, "img", "9.0", "exe", "us-west-2")
+    assert "--egress-network-connectors" not in captured["args"]
+
+
+def test_run_one_passes_egress_connector_when_given(monkeypatch):
+    captured = {}
+    def fake_aws(*args, region, **kw):
+        captured["args"] = args
+        return {"microvmId": "vm0", "endpoint": "ep"}
+    monkeypatch.setattr(fc, "aws", fake_aws)
+    arn = "arn:aws:lambda:us-west-2:123:network-connector:abc"
+    fc.run_one(0, "img", "9.0", "exe", "us-west-2", egress_connectors=[arn])
+    args = captured["args"]
+    assert "--egress-network-connectors" in args
+    assert arn in args
+    # flag must precede the connector value
+    assert args.index("--egress-network-connectors") < args.index(arn)
 
 
 def test_agentic_run_untraced_when_no_tracer(monkeypatch):

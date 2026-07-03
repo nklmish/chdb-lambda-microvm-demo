@@ -95,13 +95,23 @@ def newest_ready_version(image_arn_: str, region: str) -> str:
 # ── Per-MicroVM lifecycle ────────────────────────────────────────────────────
 
 def run_one(idx: int, image_arn_: str, version: str, exec_arn: str,
-            region: str) -> dict:
+            region: str, egress_connectors: list[str] | None = None) -> dict:
     """Launch one MicroVM. Idle/suspend/max-duration policies are a safety net so
-    a VM can never bill indefinitely even if a caller forgets to terminate."""
+    a VM can never bill indefinitely even if a caller forgets to terminate.
+
+    egress_connectors: optional Lambda MicroVMs VPC egress-connector ARNs. When
+    given, this VM's outbound traffic routes through the connector's VPC (so it can
+    reach a private Aurora over native TCP for the zone-tipping federation). Only
+    the agentic fleet passes one; the scan fleet keeps cheap default public egress.
+    """
+    extra = []
+    if egress_connectors:
+        extra = ["--egress-network-connectors", *egress_connectors]
     resp = aws(
         "lambda-microvms", "run-microvm",
         "--image-identifier", image_arn_, "--image-version", version,
         "--execution-role-arn", exec_arn,
+        *extra,
         "--idle-policy", json.dumps(
             {"maxIdleDurationSeconds": 600, "suspendedDurationSeconds": 600,
              "autoResumeEnabled": True}
@@ -850,7 +860,8 @@ def _safe(fn, *a, **k):
 
 def run_agentic_fleet_blocking(question: str, region: str, name: str, *,
                                count: int = 4, on_event=None, keep: bool = False,
-                               planner=None, synthesizer=None, tracer=None) -> dict:
+                               planner=None, synthesizer=None, tracer=None,
+                               egress_connectors: list[str] | None = None) -> dict:
     """Plan → launch → wait → ask (a *different* sub-question per VM) → synthesize
     → (terminate) an agentic fleet, emitting on_event(dict) at each milestone.
 
@@ -887,7 +898,8 @@ def run_agentic_fleet_blocking(question: str, region: str, name: str, *,
 
         with ThreadPoolExecutor(max_workers=n) as ex:
             launched = list(ex.map(
-                lambda i: run_one(i, img, version, exe, region), range(n)))
+                lambda i: run_one(i, img, version, exe, region,
+                                  egress_connectors=egress_connectors), range(n)))
         emit({"type": "launch",
               "vms": [{"idx": vm["idx"], "id": vm["id"]} for vm in launched]})
 
