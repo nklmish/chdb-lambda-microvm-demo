@@ -33,6 +33,7 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import fleet_core as fc  # noqa: E402
+import fleet_tracing as ft  # noqa: E402
 import uvicorn  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse  # noqa: E402
@@ -91,6 +92,14 @@ def build_app(default_region: str, default_name: str,
               model_id: str = fc.DEFAULT_COORDINATOR_MODEL) -> FastAPI:
     app = FastAPI()
 
+    # Build the Langfuse tracer once (SSM creds + auth check). None → untraced,
+    # and the fan-out runs exactly as before. The demo never hard-depends on it.
+    tracer = ft.build_fleet_tracer()
+    if tracer:
+        print("Langfuse tracing ON — the fan-out stitches into one distributed trace")
+    else:
+        print("Langfuse tracing OFF (no /langfuse/* creds or SDK) — running untraced")
+
     @app.get("/")
     async def index() -> FileResponse:
         return FileResponse(_AGENTIC_HTML)
@@ -102,6 +111,7 @@ def build_app(default_region: str, default_name: str,
             "defaultName": default_name,
             "maxFleet": fc.MAX_FLEET,
             "question": fc.AGENTIC_DEFAULT_QUESTION,
+            "tracing": tracer is not None,
         })
 
     @app.get("/run")
@@ -135,13 +145,16 @@ def build_app(default_region: str, default_name: str,
                 _register([v["id"] for v in ev["vms"]], region)
             if ev.get("type") == "terminated":
                 _drop(ev.get("ids", []))
+            # Enrich the terminal event with a clickable Langfuse trace URL.
+            if ev.get("type") == "done" and ev.get("trace_id"):
+                ev = {**ev, "trace_url": ft.trace_url(ev["trace_id"])}
             loop.call_soon_threadsafe(queue.put_nowait, ev)
 
         def worker() -> None:
             try:
                 fc.run_agentic_fleet_blocking(
                     q, region, name, count=n, on_event=emit, keep=keep,
-                    planner=planner, synthesizer=synthesizer)
+                    planner=planner, synthesizer=synthesizer, tracer=tracer)
             finally:
                 _run_gate.release()
                 loop.call_soon_threadsafe(queue.put_nowait, {"type": "_end"})

@@ -32,7 +32,7 @@ importlib_metadata==8.7.1
 jmespath==1.1.0
 jsonschema-specifications==2025.9.1
 jsonschema==4.26.0
-langfuse==4.7.1
+langfuse==4.13.0
 limits==5.8.0
 mcp==1.27.2
 numpy==2.4.6

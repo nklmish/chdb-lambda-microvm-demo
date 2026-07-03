@@ -56,6 +56,12 @@ BEDROCK_REGIONS = ("us-east-1", "us-east-2", "us-west-2")
 # so nothing secret is baked into the image. Override with CLICKHOUSE_SSM_REGION.
 CLICKHOUSE_SSM_REGION = os.getenv("CLICKHOUSE_SSM_REGION", "us-east-1")
 
+# Region holding the Langfuse Cloud credential params (/langfuse/*). The MicroVM
+# resolves these from SSM at boot to configure OTLP trace export to Langfuse — no
+# secret is baked into the image (mirrors the ClickHouse pattern). Override with
+# LANGFUSE_SSM_REGION.
+LANGFUSE_SSM_REGION = os.getenv("LANGFUSE_SSM_REGION", "us-east-1")
+
 # Files/dirs never shipped in the build artifact: secrets, local data, scratch,
 # build outputs, and anything irrelevant to the runtime image.
 EXCLUDE_DIRS = {
@@ -247,6 +253,29 @@ def _exec_role_policy(account: str, region: str) -> str:
                     "Condition": {
                         "StringEquals": {
                             "kms:ViaService": f"ssm.{CLICKHOUSE_SSM_REGION}.amazonaws.com"
+                        }
+                    },
+                },
+                {
+                    # Observability: read Langfuse Cloud creds from SSM /langfuse/*
+                    # at boot to configure OTLP trace export (least-privilege; no
+                    # baked secrets). Harmless when the params don't exist — the
+                    # boot cred-resolve is best-effort and just leaves tracing off.
+                    "Sid": "ReadLangfuseCreds",
+                    "Effect": "Allow",
+                    "Action": ["ssm:GetParameter", "ssm:GetParameters"],
+                    "Resource": (
+                        f"arn:aws:ssm:{LANGFUSE_SSM_REGION}:{account}:parameter/langfuse/*"
+                    ),
+                },
+                {
+                    "Sid": "DecryptLangfuseSecret",
+                    "Effect": "Allow",
+                    "Action": ["kms:Decrypt"],
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "kms:ViaService": f"ssm.{LANGFUSE_SSM_REGION}.amazonaws.com"
                         }
                     },
                 },

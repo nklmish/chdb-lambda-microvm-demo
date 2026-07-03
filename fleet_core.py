@@ -152,12 +152,17 @@ def wait_ready(vm: dict, region: str, timeout_s: float = 180) -> dict:
 
 
 def ask(vm: dict, question: str, timeout: float = 120,
-        max_answer_chars: int = 200) -> dict:
+        max_answer_chars: int = 200, trace_context: dict | None = None) -> dict:
     """Fire the question at a ready VM; records chat_ms, answer, fingerprint.
 
     max_answer_chars caps the stored answer for display: the consensus demo needs
     only the one-line count (200), but the agentic fan-out asks multi-part
     sub-questions whose answers run longer, so it passes a larger cap.
+
+    trace_context {"trace_id", "parent_span_id"}: when supplied, the question is
+    sent to /invocations (which the worker links into the caller's Langfuse trace
+    via agent.run_agent_with_tracing) instead of the untraced /chat — so each
+    MicroVM's own agent spans nest under the coordinator's fan-out trace.
     """
     if not vm.get("token"):
         vm["answer"] = "(never became ready)"
@@ -166,8 +171,15 @@ def ask(vm: dict, question: str, timeout: float = 120,
         return vm
     t0 = time.time()
     try:
-        _, body = call(vm["endpoint"], "/chat", vm["token"], method="POST",
-                       body={"text": question}, timeout=timeout)
+        if trace_context and trace_context.get("trace_id"):
+            path = "/invocations"
+            req = {"text": question,
+                   "trace_id": trace_context.get("trace_id"),
+                   "parent_span_id": trace_context.get("parent_span_id")}
+        else:
+            path, req = "/chat", {"text": question}
+        _, body = call(vm["endpoint"], path, vm["token"], method="POST",
+                       body=req, timeout=timeout)
         answer = json.loads(body).get("response", "")
         vm["answer"] = answer[:max_answer_chars]
         vm["fingerprint"] = fingerprint(answer)
@@ -827,23 +839,44 @@ def bedrock_synthesizer(region: str, model_id: str = DEFAULT_COORDINATOR_MODEL):
     return synthesizer
 
 
+def _safe(fn, *a, **k):
+    """Call a tracer method, swallowing any error — observability must NEVER break
+    a fleet run. Returns the result or None."""
+    try:
+        return fn(*a, **k)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def run_agentic_fleet_blocking(question: str, region: str, name: str, *,
                                count: int = 4, on_event=None, keep: bool = False,
-                               planner=None, synthesizer=None) -> dict:
+                               planner=None, synthesizer=None, tracer=None) -> dict:
     """Plan → launch → wait → ask (a *different* sub-question per VM) → synthesize
     → (terminate) an agentic fleet, emitting on_event(dict) at each milestone.
 
     on_event receives dicts with a "type": preflight | launch | ready | plan |
     answer | synthesis | done | terminated | error. Termination is guaranteed in
     `finally` unless keep=True, even if a later phase raises.
+
+    tracer (optional, duck-typed FleetTracer): when supplied, the whole fan-out is
+    stitched into ONE Langfuse trace — a root span with plan / agent-i / synthesis
+    children, and each worker's own agent trace propagated via trace_context so it
+    nests under agent-i. Tracing failures never interrupt the run (see _safe).
     """
     def emit(ev: dict) -> None:
         if on_event:
             on_event(ev)
 
+    root = _safe(tracer.start_root, question, clamp_count(count)) if tracer else None
+
+    plan_span = _safe(tracer.child, root, "plan", input=question) if root else None
     plan = plan_subquestions(question, clamp_count(count), planner=planner)
+    if plan_span:
+        _safe(plan_span.update, output=plan)
+        _safe(plan_span.end)
     n = len(plan)
     launched: list[dict] = []
+    final: str | None = None
     try:
         acct = account(region)
         img = image_arn(acct, region, name)
@@ -869,29 +902,54 @@ def run_agentic_fleet_blocking(question: str, region: str, name: str, *,
               "items": [{"idx": vm["idx"], "subquestion": vm["subquestion"]}
                         for vm in launched]})
 
+        # One coordinator-side span per worker; each worker's own agent spans nest
+        # under it via the trace_context we hand to /invocations.
+        worker_spans: dict = {}
+        if root:
+            for vm in launched:
+                worker_spans[vm["idx"]] = _safe(
+                    tracer.start_worker, root, vm["idx"], vm["subquestion"])
+
+        def ask_one(vm: dict) -> dict:
+            ws = worker_spans.get(vm["idx"])
+            tctx = _safe(tracer.context, ws) if ws else None
+            ask(vm, vm["subquestion"], 120, 600, trace_context=tctx)
+            if ws:
+                _safe(ws.update, output=vm.get("answer"),
+                      metadata={"microvm_id": vm.get("id"), "chat_ms": vm.get("chat_ms")})
+                _safe(ws.end)
+            return vm
+
         wall0 = time.time()
         with ThreadPoolExecutor(max_workers=n) as ex:
-            futures = [ex.submit(ask, vm, vm["subquestion"], 120, 600)
-                       for vm in launched]
-            for fut in futures:
+            for fut in [ex.submit(ask_one, vm) for vm in launched]:
                 vm = fut.result()
                 emit({"type": "answer", "idx": vm["idx"], "chat_ms": vm["chat_ms"],
                       "subquestion": vm.get("subquestion", ""),
                       "answer": vm.get("answer", "")})
         wall_ms = round((time.time() - wall0) * 1000)
 
+        syn_span = _safe(tracer.child, root, "synthesis", input=question) if root else None
         final = synthesize(question, launched, synthesizer=synthesizer)
+        if syn_span:
+            _safe(syn_span.update, output=final)
+            _safe(syn_span.end)
         emit({"type": "synthesis", "text": final})
 
         ok = sum(1 for vm in launched if vm.get("chat_ms"))
+        trace_id = getattr(root, "trace_id", None) if root else None
         summary = {"type": "done", "wall_ms": wall_ms, "ok": ok, "total": n,
-                   "synthesis": final}
+                   "synthesis": final, "trace_id": trace_id}
         emit(summary)
         return summary
     except Exception as e:  # noqa: BLE001 — surface, then always clean up
         emit({"type": "error", "message": str(e)})
         return {"type": "error", "message": str(e)}
     finally:
+        if root:
+            _safe(root.update, output=final)
+            _safe(root.end)
+            _safe(tracer.flush)
         if not keep and launched:
             terminate_all(launched, region)
             emit({"type": "terminated", "ids": [vm["id"] for vm in launched]})
