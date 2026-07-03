@@ -162,7 +162,8 @@ def wait_ready(vm: dict, region: str, timeout_s: float = 180) -> dict:
 
 
 def ask(vm: dict, question: str, timeout: float = 120,
-        max_answer_chars: int = 200, trace_context: dict | None = None) -> dict:
+        max_answer_chars: int = 200, trace_context: dict | None = None,
+        session_id: str | None = None) -> dict:
     """Fire the question at a ready VM; records chat_ms, answer, fingerprint.
 
     max_answer_chars caps the stored answer for display: the consensus demo needs
@@ -173,6 +174,9 @@ def ask(vm: dict, question: str, timeout: float = 120,
     sent to /invocations (which the worker links into the caller's Langfuse trace
     via agent.run_agent_with_tracing) instead of the untraced /chat — so each
     MicroVM's own agent spans nest under the coordinator's fan-out trace.
+
+    session_id: groups this worker's own trace into a Langfuse Session (used by the
+    consensus fleet, where each worker produces a separate trace).
     """
     if not vm.get("token"):
         vm["answer"] = "(never became ready)"
@@ -188,6 +192,8 @@ def ask(vm: dict, question: str, timeout: float = 120,
                    "parent_span_id": trace_context.get("parent_span_id")}
         else:
             path, req = "/chat", {"text": question}
+        if session_id:
+            req["session_id"] = session_id
         _, body = call(vm["endpoint"], path, vm["token"], method="POST",
                        body=req, timeout=timeout)
         answer = json.loads(body).get("response", "")
@@ -254,18 +260,24 @@ def consensus(vms: list[dict]) -> dict:
 
 
 def run_fleet_blocking(n: int, region: str, name: str, question: str,
-                       *, on_event=None, keep: bool = False) -> dict:
+                       *, on_event=None, keep: bool = False,
+                       session_id: str | None = None) -> dict:
     """Launch → wait → ask → (terminate) a fleet, calling on_event(dict) at each
     milestone. Used by both front-ends. Returns the final summary dict.
 
     on_event receives dicts with a "type": preflight | launch | ready | answer |
     done | terminated | error. Termination is guaranteed in `finally` unless
     keep=True, even if a later phase raises.
+
+    session_id: one Langfuse session for the whole consensus run — each worker
+    produces its own trace, so passing a shared session_id groups them in the
+    Sessions view (generated per run when not supplied).
     """
     def emit(ev: dict) -> None:
         if on_event:
             on_event(ev)
 
+    sess_id = session_id or _gen_session_id("consensus")
     n = clamp_count(n)
     launched: list[dict] = []
     try:
@@ -290,7 +302,8 @@ def run_fleet_blocking(n: int, region: str, name: str, question: str,
 
         wall0 = time.time()
         with ThreadPoolExecutor(max_workers=n) as ex:
-            futures = [ex.submit(ask, vm, question) for vm in launched]
+            futures = [ex.submit(ask, vm, question, session_id=sess_id)
+                       for vm in launched]
             for fut in futures:
                 vm = fut.result()
                 emit({"type": "answer", "idx": vm["idx"], "chat_ms": vm["chat_ms"],
@@ -299,7 +312,7 @@ def run_fleet_blocking(n: int, region: str, name: str, question: str,
 
         ok = sum(1 for vm in launched if vm.get("chat_ms"))
         summary = {"type": "done", "wall_ms": wall_ms, "ok": ok, "total": n,
-                   "consensus": consensus(launched)}
+                   "consensus": consensus(launched), "session_id": sess_id}
         emit(summary)
         return summary
     except Exception as e:  # noqa: BLE001 — surface, then always clean up

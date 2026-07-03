@@ -27,3 +27,18 @@ def test_configure_langfuse_runtime_noop_without_flag(monkeypatch):
     monkeypatch.delenv("LANGFUSE_RESOLVE_FROM_SSM", raising=False)
     # No flag → returns False, never touches AWS.
     assert obs.configure_langfuse_runtime() is False
+
+
+def test_session_scope_nullcontext_without_id():
+    # No session_id → a real no-op context manager (never raises, groups nothing).
+    with obs.session_scope(None):
+        pass
+    with obs.session_scope("", "user"):
+        pass
+
+
+def test_session_scope_returns_usable_context_manager_with_id():
+    # With an id, returns a usable context manager even if langfuse is unconfigured
+    # (best-effort: falls back to nullcontext on any SDK error).
+    with obs.session_scope("sess-1", "u"):
+        pass

@@ -270,6 +270,42 @@ def test_ask_with_trace_context_routes_to_invocations(monkeypatch):
     assert store["body"] == {"text": "sub?", "trace_id": "T1", "parent_span_id": "S1"}
 
 
+def test_ask_includes_session_id_in_body(monkeypatch):
+    store: dict = {}
+    monkeypatch.setattr(fc, "call", _fake_call_capturing(store))
+    vm = {"idx": 0, "token": "tok", "endpoint": "ep"}
+    fc.ask(vm, "busiest hour?", session_id="consensus-abc123")
+    assert store["path"] == "/chat"
+    assert store["body"]["session_id"] == "consensus-abc123"
+
+
+def test_consensus_run_generates_session_and_passes_to_workers(monkeypatch):
+    seen_sessions: list = []
+    monkeypatch.setattr(fc, "account", lambda region: "123456789012")
+    monkeypatch.setattr(fc, "newest_ready_version", lambda img, region: "12.0")
+    monkeypatch.setattr(fc, "run_one",
+                        lambda i, img, v, exe, region, egress_connectors=None: {
+                            "idx": i, "id": f"vm{i}", "endpoint": "ep"})
+    monkeypatch.setattr(fc, "wait_ready",
+                        lambda vm, region: {**vm, "ready_s": 1.0, "token": "t"})
+
+    def fake_ask(vm, q, timeout=120, max_answer_chars=200, trace_context=None, session_id=None):
+        seen_sessions.append(session_id)
+        vm["answer"] = "6 PM 690932 trips"
+        vm["chat_ms"] = 100
+        vm["fingerprint"] = "690932"
+        return vm
+
+    monkeypatch.setattr(fc, "ask", fake_ask)
+    monkeypatch.setattr(fc, "terminate_all", lambda vms, region: None)
+
+    summary = fc.run_fleet_blocking(3, "us-west-2", "img", "busiest hour?", keep=True)
+    assert summary["session_id"].startswith("consensus-")
+    # every worker got the SAME session id → grouped in the Sessions view
+    assert set(seen_sessions) == {summary["session_id"]}
+    assert len(seen_sessions) == 3
+
+
 # ── run_agentic_fleet_blocking stitches the fan-out into one trace tree ──
 
 class _FakeSpan:
