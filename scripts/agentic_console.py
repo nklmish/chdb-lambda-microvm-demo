@@ -29,6 +29,7 @@ import os
 import signal
 import sys
 import threading
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -56,6 +57,38 @@ def _resolve_egress_connectors(region: str) -> list[str] | None:
         return [arn] if arn else None
     except Exception:  # noqa: BLE001 — no connector / no perms → public egress
         return None
+
+
+def _prewarm_aurora(region: str, emit) -> None:
+    """Wake the auto-paused Aurora (min 0 ACU) before the zone-tipping worker hits
+    it over native TCP, so the first federated JOIN doesn't time out on cold-start.
+
+    Fires a Data API SELECT (HTTPS — no VPC needed) and waits until the cluster
+    responds. Best-effort: silently skips when the federation stack isn't deployed.
+    Emits {"type":"prewarm","status": start|done|timeout} so the page can show it.
+    """
+    try:
+        import boto3
+
+        ssm = boto3.client("ssm", region_name=region)
+        cluster = ssm.get_parameter(
+            Name="/federation/AURORA_CLUSTER_ARN")["Parameter"]["Value"]
+        secret = ssm.get_parameter(
+            Name="/federation/AURORA_SECRET_ARN")["Parameter"]["Value"]
+        rds = boto3.client("rds-data", region_name=region)
+    except Exception:  # noqa: BLE001 — no federation stack → nothing to warm
+        return
+    emit({"type": "prewarm", "status": "start"})
+    deadline = time.time() + 100
+    while time.time() < deadline:
+        try:
+            rds.execute_statement(resourceArn=cluster, secretArn=secret,
+                                  database="nyctaxi", sql="SELECT 1")
+            emit({"type": "prewarm", "status": "done"})
+            return
+        except Exception:  # noqa: BLE001 — DatabaseResuming/Unavailable → retry
+            time.sleep(6)
+    emit({"type": "prewarm", "status": "timeout"})
 
 # Crash-safety registry: ids launched by a *non-keep* run, terminated on exit if
 # the run didn't finish cleanly (e.g. the server was killed mid-fan-out).
@@ -172,6 +205,11 @@ def build_app(default_region: str, default_name: str,
 
         def worker() -> None:
             try:
+                # When federating to the private Aurora, wake it first so the
+                # zone-tipping worker's first native-TCP JOIN doesn't hit a
+                # cold (auto-paused) cluster and time out.
+                if egress_connectors:
+                    _prewarm_aurora(region, emit)
                 fc.run_agentic_fleet_blocking(
                     q, region, name, count=n, on_event=emit, keep=keep,
                     planner=planner, synthesizer=synthesizer, tracer=tracer,

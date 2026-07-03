@@ -226,7 +226,10 @@
         }
 
         function handleEvent(d) {
-            if (d.type === 'preflight') {
+            if (d.type === 'prewarm') {
+                if (d.status === 'start') $('phase').textContent = 'warming federation database (Aurora resuming from $0)…';
+                else if (d.status === 'timeout') $('phase').textContent = 'federation DB still warming — the zone worker may fall back…';
+            } else if (d.type === 'preflight') {
                 const plural = d.n === 1 ? 'agent' : 'agents';
                 $('phase').textContent = `decomposed into ${d.n} sub-question(s) — launching ${d.n} ${plural} from ${d.region} image v${d.version} …`;
             } else if (d.type === 'launch') {
