@@ -858,10 +858,19 @@ def _safe(fn, *a, **k):
         return None
 
 
+def _gen_session_id(prefix: str = "agentic") -> str:
+    import uuid
+
+    return f"{prefix}-{uuid.uuid4().hex[:12]}"
+
+
 def run_agentic_fleet_blocking(question: str, region: str, name: str, *,
                                count: int = 4, on_event=None, keep: bool = False,
                                planner=None, synthesizer=None, tracer=None,
-                               egress_connectors: list[str] | None = None) -> dict:
+                               egress_connectors: list[str] | None = None,
+                               session_id: str | None = None,
+                               user_id: str = "fleet-console",
+                               tags: list[str] | None = None) -> dict:
     """Plan → launch → wait → ask (a *different* sub-question per VM) → synthesize
     → (terminate) an agentic fleet, emitting on_event(dict) at each milestone.
 
@@ -877,6 +886,18 @@ def run_agentic_fleet_blocking(question: str, region: str, name: str, *,
     def emit(ev: dict) -> None:
         if on_event:
             on_event(ev)
+
+    # Langfuse session grouping: stamp session_id / user_id / tags on the whole
+    # distributed trace so runs land grouped in the Sessions view. Entered BEFORE
+    # any observation is created; exited in `finally`. Best-effort (never breaks).
+    sess_id = session_id or _gen_session_id()
+    _scope = None
+    if tracer:
+        _scope = _safe(tracer.run_scope, session_id=sess_id, user_id=user_id,
+                       tags=tags or ["agentic-fanout", "microvm-fleet", f"region:{region}"],
+                       metadata={"region": region, "fleet_size": clamp_count(count)})
+        if _scope is not None:
+            _safe(_scope.__enter__)
 
     root = _safe(tracer.start_root, question, clamp_count(count)) if tracer else None
 
@@ -951,7 +972,8 @@ def run_agentic_fleet_blocking(question: str, region: str, name: str, *,
         ok = sum(1 for vm in launched if vm.get("chat_ms"))
         trace_id = getattr(root, "trace_id", None) if root else None
         summary = {"type": "done", "wall_ms": wall_ms, "ok": ok, "total": n,
-                   "synthesis": final, "trace_id": trace_id}
+                   "synthesis": final, "trace_id": trace_id,
+                   "session_id": sess_id if tracer else None}
         emit(summary)
         return summary
     except Exception as e:  # noqa: BLE001 — surface, then always clean up
@@ -962,6 +984,8 @@ def run_agentic_fleet_blocking(question: str, region: str, name: str, *,
             _safe(root.update, output=final)
             _safe(root.end)
             _safe(tracer.flush)
+        if _scope is not None:
+            _safe(_scope.__exit__, None, None, None)
         if not keep and launched:
             terminate_all(launched, region)
             emit({"type": "terminated", "ids": [vm["id"] for vm in launched]})

@@ -268,7 +268,8 @@
                     a.classList.add('show');
                 }
                 $('headline').classList.add('show');
-                $('phase').textContent = `${d.ok}/${d.total} answered · synthesized into one briefing.`;
+                const sess = d.session_id ? ` · Langfuse session ${d.session_id}` : '';
+                $('phase').textContent = `${d.ok}/${d.total} answered · synthesized into one briefing${sess}.`;
             } else if (d.type === 'terminated') {
                 $('phase').textContent += `  fleet terminated (${d.ids.length} MicroVMs).`;
             } else if (d.type === 'error') {

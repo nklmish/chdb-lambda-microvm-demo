@@ -287,11 +287,30 @@ class _FakeSpan:
         self.ended = True
 
 
+class _FakeScope:
+    def __init__(self, log, kwargs):
+        self.log = log
+        self.kwargs = kwargs
+
+    def __enter__(self):
+        self.log.append(("scope_enter", self.kwargs))
+        return self
+
+    def __exit__(self, *a):
+        self.log.append(("scope_exit", None))
+        return False
+
+
 class _FakeTracer:
     """Records the trace-tree calls fleet_core makes, returns fake spans."""
     def __init__(self):
         self.calls: list = []
         self.flushed = False
+        self.scope_kwargs: dict | None = None
+
+    def run_scope(self, **kwargs):
+        self.scope_kwargs = kwargs
+        return _FakeScope(self.calls, kwargs)
 
     def start_root(self, question, n):
         self.calls.append(("root", n))
@@ -350,7 +369,13 @@ def test_agentic_run_stitches_one_trace_and_propagates_context(monkeypatch):
 
     assert summary["type"] == "done"
     assert summary["trace_id"] == "TRACE"           # root trace id surfaced
+    # session grouping: a session_id is set, surfaced, and the scope wraps the run
+    assert summary["session_id"] and summary["session_id"].startswith("agentic-")
+    assert tracer.scope_kwargs["session_id"] == summary["session_id"]
+    assert "agentic-fanout" in tracer.scope_kwargs["tags"]
+    assert tracer.scope_kwargs["user_id"] == "fleet-console"
     kinds = [c[0] for c in tracer.calls]
+    assert kinds[0] == "scope_enter" and kinds[-1] == "scope_exit"   # wraps the run
     assert kinds.count("root") == 1
     assert ("child", "plan") in tracer.calls
     assert ("child", "synthesis") in tracer.calls

@@ -98,8 +98,39 @@ class FleetTracer:
         """
         return {"trace_id": span.trace_id, "parent_span_id": span.id}
 
+    def run_scope(self, *, session_id: str, user_id: str | None = None,
+                  tags: list[str] | None = None, environment: str | None = None,
+                  metadata: dict | None = None):
+        """Context manager that stamps session_id / user_id / tags / environment on
+        every observation — and thus the trace — created within it.
+
+        Langfuse's canonical v4 way to group a run's traces into a Session
+        (verified against v4 docs + a live trace). Because these are trace-level
+        attributes, the whole distributed trace — including the remote MicroVM
+        worker spans that nest in via trace_context — is grouped under the session.
+        """
+        from langfuse import propagate_attributes
+
+        kwargs: dict = {"session_id": session_id}
+        if user_id:
+            kwargs["user_id"] = user_id
+        if tags:
+            kwargs["tags"] = tags
+        if environment:
+            kwargs["environment"] = environment
+        if metadata:
+            kwargs["metadata"] = metadata
+        return propagate_attributes(**kwargs)
+
     def flush(self) -> None:
         self.client.flush()
+
+
+def new_session_id(prefix: str = "agentic") -> str:
+    """A short, unique Langfuse session id for one fleet run."""
+    import uuid
+
+    return f"{prefix}-{uuid.uuid4().hex[:12]}"
 
 
 def build_fleet_tracer(region: str = LANGFUSE_SSM_REGION) -> "FleetTracer | None":
