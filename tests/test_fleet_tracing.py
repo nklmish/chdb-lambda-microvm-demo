@@ -81,12 +81,36 @@ def test_flush_delegates_to_client():
     assert t.client.log["flushed"] is True
 
 
-def test_trace_url_uses_host_and_trace_id(monkeypatch):
+def _reset_project_cache(monkeypatch):
+    """Clear observability's cached project id so trace_url tests don't leak state."""
+    import observability
+
+    monkeypatch.setattr(observability, "_langfuse_project_id", None)
+    monkeypatch.setattr(observability, "_project_id_lookup_done", False)
+
+
+def test_trace_url_uses_project_path_when_project_id_known(monkeypatch):
+    _reset_project_cache(monkeypatch)
+    monkeypatch.setenv("LANGFUSE_HOST", "https://cloud.langfuse.com/")
+    monkeypatch.setenv("LANGFUSE_PROJECT_ID", "proj-xyz")
+    assert (
+        ft.trace_url("abc123")
+        == "https://cloud.langfuse.com/project/proj-xyz/traces/abc123"
+    )
+
+
+def test_trace_url_falls_back_to_short_form_without_project(monkeypatch):
+    # No project id and no keys → no lookup; the short form is the graceful fallback.
+    _reset_project_cache(monkeypatch)
+    monkeypatch.delenv("LANGFUSE_PROJECT_ID", raising=False)
+    monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
+    monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
     monkeypatch.setenv("LANGFUSE_HOST", "https://cloud.langfuse.com/")
     assert ft.trace_url("abc123") == "https://cloud.langfuse.com/trace/abc123"
 
 
 def test_trace_url_none_without_host(monkeypatch):
+    _reset_project_cache(monkeypatch)
     monkeypatch.delenv("LANGFUSE_HOST", raising=False)
     assert ft.trace_url("abc123") is None
 

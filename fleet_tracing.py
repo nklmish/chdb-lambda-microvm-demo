@@ -57,9 +57,14 @@ def load_langfuse_env_from_ssm(region: str = LANGFUSE_SSM_REGION) -> bool:
 
 
 def trace_url(trace_id: str | None) -> str | None:
-    """Public Langfuse URL for a trace id, or None when host/id is unknown."""
-    host = os.environ.get("LANGFUSE_HOST", "").rstrip("/")
-    return f"{host}/trace/{trace_id}" if (host and trace_id) else None
+    """Canonical Langfuse UI URL for a trace id, or None when host/id is unknown.
+
+    Delegates to observability.trace_url (project-scoped `/project/{id}/traces/…`
+    path). Imported lazily so fleet_tracing's top level stays dependency-light.
+    """
+    from observability import trace_url as _trace_url
+
+    return _trace_url(trace_id)
 
 
 class FleetTracer:

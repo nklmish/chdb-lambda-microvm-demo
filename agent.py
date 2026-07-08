@@ -288,8 +288,9 @@ async def stream_chat_with_agent(
     memory.save_conversation("user", user_input)
     memory.save_conversation("assistant", response_text)
 
-    langfuse_host = os.environ.get("LANGFUSE_HOST", "").rstrip("/")
-    trace_url = f"{langfuse_host}/trace/{trace_id}" if (trace_id and langfuse_host) else None
+    from observability import trace_url as build_trace_url
+
+    trace_url = build_trace_url(trace_id)
 
     yield {
         "type": "done",

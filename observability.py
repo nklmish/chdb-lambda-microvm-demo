@@ -60,6 +60,67 @@ def session_scope(session_id: str | None, user_id: str | None = None,
 
 _initialized = False
 _langfuse_runtime_configured = False
+_langfuse_project_id: str | None = None
+_project_id_lookup_done = False
+
+
+def resolve_langfuse_project_id() -> str | None:
+    """The Langfuse project id, for building canonical trace URLs. Cached.
+
+    Prefers LANGFUSE_PROJECT_ID; otherwise resolves it once via the
+    project-scoped public/secret keys against /api/public/projects (the keys map
+    to exactly one project). Returns None when host/keys are absent or the lookup
+    fails — callers fall back gracefully. The network is attempted at most once
+    per process (only when creds are present), so a failure never adds latency to
+    later calls.
+    """
+    global _langfuse_project_id, _project_id_lookup_done
+    if _langfuse_project_id:
+        return _langfuse_project_id
+    env = os.environ.get("LANGFUSE_PROJECT_ID")
+    if env:
+        _langfuse_project_id = env
+        return env
+    host = os.environ.get("LANGFUSE_HOST", "").rstrip("/")
+    pk = os.environ.get("LANGFUSE_PUBLIC_KEY")
+    sk = os.environ.get("LANGFUSE_SECRET_KEY")
+    if not (host and pk and sk):
+        return None  # creds not ready yet — don't burn the one-shot attempt
+    if _project_id_lookup_done:
+        return None
+    _project_id_lookup_done = True
+    try:
+        import urllib.request
+
+        auth = base64.b64encode(f"{pk}:{sk}".encode()).decode()
+        req = urllib.request.Request(f"{host}/api/public/projects")
+        req.add_header("Authorization", f"Basic {auth}")
+        with urllib.request.urlopen(req, timeout=5) as r:  # noqa: S310
+            data = json.loads(r.read().decode())
+        pid = (data.get("data") or [{}])[0].get("id")
+        if pid:
+            _langfuse_project_id = pid
+        return pid
+    except Exception as e:  # noqa: BLE001 — no network/keys → no canonical URL
+        logger.debug("langfuse project id resolve failed: %s", e)
+        return None
+
+
+def trace_url(trace_id: str | None) -> str | None:
+    """Canonical Langfuse UI URL for a trace id, or None when host/id is unknown.
+
+    Uses the project-scoped path `/project/{id}/traces/{trace_id}` — the short
+    `/trace/{id}` form does not resolve in the Langfuse UI. Falls back to the
+    short form only when the project id can't be resolved (better a redirecting
+    link than none).
+    """
+    host = os.environ.get("LANGFUSE_HOST", "").rstrip("/")
+    if not (host and trace_id):
+        return None
+    pid = resolve_langfuse_project_id()
+    if pid:
+        return f"{host}/project/{pid}/traces/{trace_id}"
+    return f"{host}/trace/{trace_id}"
 
 
 def build_langfuse_otel_env(host: str, public_key: str, secret_key: str) -> dict:
