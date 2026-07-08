@@ -276,6 +276,12 @@ python scripts/chdb_memory_demo.py
   live, with a safe fallback to fanning the raw question if planning fails. Same tested core
   ([`fleet_core.py`](fleet_core.py)), server-side orchestration (auth tokens never reach the
   browser), and guaranteed teardown as the consensus console.
+
+  When Langfuse creds are present (`/langfuse/*` in SSM), the whole fan-out stitches into a
+  **single distributed trace** — a coordinator root with `plan` / `agent-i` / `synthesis`
+  children, each worker's own MicroVM agent spans nesting in via remote W3C trace-context, all
+  grouped under one Langfuse Session. See the cookbook:
+  [docs/langfuse-distributed-tracing.md](docs/langfuse-distributed-tracing.md).
 - **Zero-refactor graduation to ClickHouse Cloud** — the *same* analytical SQL served from a
   local chDB table, then from ClickHouse Cloud via `remoteSecure()` — only the view's source
   changes:
