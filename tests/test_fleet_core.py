@@ -4,6 +4,8 @@ The AWS-touching functions (run_one, wait_ready, ask, terminate) are exercised
 live by the fleet demos; here we lock the pure helpers that decide the headline
 numbers and the consensus verdict.
 """
+import json
+
 import fleet_core as fc
 
 
@@ -236,3 +238,236 @@ def test_synthesize_falls_back_to_template_when_synthesizer_empty():
     vms = [_answered(0, "q1", "answer one")]
     out = fc.synthesize("briefing", vms, synthesizer=lambda q, v: "   ")
     assert "answer one" in out
+
+
+# ── ask() trace-context routing (the cross-process propagation contract) ──
+
+def _fake_call_capturing(store, response="6 PM with 690,932 trips"):
+    def fake_call(endpoint, path, token, *, method="GET", body=None, timeout=90):
+        store["path"] = path
+        store["body"] = body
+        return 200, json.dumps({"response": response})
+    return fake_call
+
+
+def test_ask_without_trace_context_uses_chat(monkeypatch):
+    store: dict = {}
+    monkeypatch.setattr(fc, "call", _fake_call_capturing(store))
+    vm = {"idx": 0, "token": "tok", "endpoint": "ep"}
+    fc.ask(vm, "busiest hour?")
+    assert store["path"] == "/chat"
+    assert store["body"] == {"text": "busiest hour?"}
+    assert vm["answer"].startswith("6 PM")
+    assert vm["fingerprint"] == "690932"
+
+
+def test_ask_with_trace_context_routes_to_invocations(monkeypatch):
+    store: dict = {}
+    monkeypatch.setattr(fc, "call", _fake_call_capturing(store, response="answer"))
+    vm = {"idx": 0, "token": "tok", "endpoint": "ep"}
+    fc.ask(vm, "sub?", trace_context={"trace_id": "T1", "parent_span_id": "S1"})
+    assert store["path"] == "/invocations"
+    assert store["body"] == {"text": "sub?", "trace_id": "T1", "parent_span_id": "S1"}
+
+
+def test_ask_includes_session_id_in_body(monkeypatch):
+    store: dict = {}
+    monkeypatch.setattr(fc, "call", _fake_call_capturing(store))
+    vm = {"idx": 0, "token": "tok", "endpoint": "ep"}
+    fc.ask(vm, "busiest hour?", session_id="consensus-abc123")
+    assert store["path"] == "/chat"
+    assert store["body"]["session_id"] == "consensus-abc123"
+
+
+def test_consensus_run_generates_session_and_passes_to_workers(monkeypatch):
+    seen_sessions: list = []
+    monkeypatch.setattr(fc, "account", lambda region: "123456789012")
+    monkeypatch.setattr(fc, "newest_ready_version", lambda img, region: "12.0")
+    monkeypatch.setattr(fc, "run_one",
+                        lambda i, img, v, exe, region, egress_connectors=None: {
+                            "idx": i, "id": f"vm{i}", "endpoint": "ep"})
+    monkeypatch.setattr(fc, "wait_ready",
+                        lambda vm, region: {**vm, "ready_s": 1.0, "token": "t"})
+
+    seen_names: list = []
+
+    def fake_ask(vm, q, timeout=120, max_answer_chars=200, trace_context=None,
+                 session_id=None, trace_name=None):
+        seen_sessions.append(session_id)
+        seen_names.append(trace_name)
+        vm["answer"] = "6 PM 690932 trips"
+        vm["chat_ms"] = 100
+        vm["fingerprint"] = "690932"
+        return vm
+
+    monkeypatch.setattr(fc, "ask", fake_ask)
+    monkeypatch.setattr(fc, "terminate_all", lambda vms, region: None)
+
+    summary = fc.run_fleet_blocking(3, "us-west-2", "img", "busiest hour?", keep=True)
+    assert summary["session_id"].startswith("consensus-")
+    # every worker got the SAME session id → grouped in the Sessions view
+    assert set(seen_sessions) == {summary["session_id"]}
+    assert len(seen_sessions) == 3
+    # and a descriptive trace name (not "POST /chat")
+    assert set(seen_names) == {"consensus-worker"}
+
+
+def test_ask_includes_trace_name_in_body(monkeypatch):
+    store: dict = {}
+    monkeypatch.setattr(fc, "call", _fake_call_capturing(store))
+    vm = {"idx": 0, "token": "tok", "endpoint": "ep"}
+    fc.ask(vm, "q", session_id="s", trace_name="consensus-worker")
+    assert store["body"]["trace_name"] == "consensus-worker"
+
+
+# ── run_agentic_fleet_blocking stitches the fan-out into one trace tree ──
+
+class _FakeSpan:
+    def __init__(self, name):
+        self.name = name
+        self.trace_id = "TRACE"
+        self.id = "span-" + name
+        self.output = None
+        self.ended = False
+
+    def update(self, **kw):
+        self.output = kw.get("output")
+
+    def end(self):
+        self.ended = True
+
+
+class _FakeScope:
+    def __init__(self, log, kwargs):
+        self.log = log
+        self.kwargs = kwargs
+
+    def __enter__(self):
+        self.log.append(("scope_enter", self.kwargs))
+        return self
+
+    def __exit__(self, *a):
+        self.log.append(("scope_exit", None))
+        return False
+
+
+class _FakeTracer:
+    """Records the trace-tree calls fleet_core makes, returns fake spans."""
+    def __init__(self):
+        self.calls: list = []
+        self.flushed = False
+        self.scope_kwargs: dict | None = None
+
+    def run_scope(self, **kwargs):
+        self.scope_kwargs = kwargs
+        return _FakeScope(self.calls, kwargs)
+
+    def start_root(self, question, n):
+        self.calls.append(("root", n))
+        return _FakeSpan("root")
+
+    def child(self, parent, name, *, input=None):
+        self.calls.append(("child", name))
+        return _FakeSpan(name)
+
+    def start_worker(self, root, idx, subquestion):
+        self.calls.append(("worker", idx))
+        return _FakeSpan(f"agent-{idx}")
+
+    @staticmethod
+    def context(span):
+        return {"trace_id": span.trace_id, "parent_span_id": span.id}
+
+    def flush(self):
+        self.flushed = True
+
+
+def _stub_aws(monkeypatch, seen_ctx):
+    monkeypatch.setattr(fc, "account", lambda region: "123456789012")
+    monkeypatch.setattr(fc, "newest_ready_version", lambda img, region: "9.0")
+    monkeypatch.setattr(fc, "run_one",
+                        lambda i, img, v, exe, region, egress_connectors=None: {
+                            "idx": i, "id": f"vm{i}", "endpoint": "ep"})
+
+    def fake_wait(vm, region):
+        vm["ready_s"] = 1.0
+        vm["token"] = "tok"
+        return vm
+
+    def fake_ask(vm, q, timeout=120, max_answer_chars=200, trace_context=None):
+        vm["answer"] = f"ans-{vm['idx']}"
+        vm["chat_ms"] = 100
+        vm["fingerprint"] = None
+        seen_ctx[vm["idx"]] = trace_context
+        return vm
+
+    monkeypatch.setattr(fc, "wait_ready", fake_wait)
+    monkeypatch.setattr(fc, "ask", fake_ask)
+    monkeypatch.setattr(fc, "terminate_all", lambda vms, region: None)
+
+
+def test_agentic_run_stitches_one_trace_and_propagates_context(monkeypatch):
+    seen_ctx: dict = {}
+    _stub_aws(monkeypatch, seen_ctx)
+    tracer = _FakeTracer()
+
+    summary = fc.run_agentic_fleet_blocking(
+        "Q", "us-west-2", "img", count=2,
+        planner=lambda q, n: ["subA", "subB"],
+        synthesizer=lambda q, v: "FINAL BRIEFING",
+        tracer=tracer, keep=True)
+
+    assert summary["type"] == "done"
+    assert summary["trace_id"] == "TRACE"           # root trace id surfaced
+    # session grouping: a session_id is set, surfaced, and the scope wraps the run
+    assert summary["session_id"] and summary["session_id"].startswith("agentic-")
+    assert tracer.scope_kwargs["session_id"] == summary["session_id"]
+    assert "agentic-fanout" in tracer.scope_kwargs["tags"]
+    assert tracer.scope_kwargs["user_id"] == "fleet-console"
+    kinds = [c[0] for c in tracer.calls]
+    assert kinds[0] == "scope_enter" and kinds[-1] == "scope_exit"   # wraps the run
+    assert kinds.count("root") == 1
+    assert ("child", "plan") in tracer.calls
+    assert ("child", "synthesis") in tracer.calls
+    assert kinds.count("worker") == 2               # one span per MicroVM
+    assert tracer.flushed is True
+    # every worker was linked to the SAME trace, under DISTINCT parent spans
+    assert seen_ctx[0]["trace_id"] == "TRACE" == seen_ctx[1]["trace_id"]
+    assert seen_ctx[0]["parent_span_id"] != seen_ctx[1]["parent_span_id"]
+
+
+def test_run_one_omits_egress_connector_by_default(monkeypatch):
+    captured = {}
+    def fake_aws(*args, region, **kw):
+        captured["args"] = args
+        return {"microvmId": "vm0", "endpoint": "ep"}
+    monkeypatch.setattr(fc, "aws", fake_aws)
+    fc.run_one(0, "img", "9.0", "exe", "us-west-2")
+    assert "--egress-network-connectors" not in captured["args"]
+
+
+def test_run_one_passes_egress_connector_when_given(monkeypatch):
+    captured = {}
+    def fake_aws(*args, region, **kw):
+        captured["args"] = args
+        return {"microvmId": "vm0", "endpoint": "ep"}
+    monkeypatch.setattr(fc, "aws", fake_aws)
+    arn = "arn:aws:lambda:us-west-2:123:network-connector:abc"
+    fc.run_one(0, "img", "9.0", "exe", "us-west-2", egress_connectors=[arn])
+    args = captured["args"]
+    assert "--egress-network-connectors" in args
+    assert arn in args
+    # flag must precede the connector value
+    assert args.index("--egress-network-connectors") < args.index(arn)
+
+
+def test_agentic_run_untraced_when_no_tracer(monkeypatch):
+    seen_ctx: dict = {}
+    _stub_aws(monkeypatch, seen_ctx)
+    summary = fc.run_agentic_fleet_blocking(
+        "Q", "us-west-2", "img", count=2,
+        planner=lambda q, n: ["subA", "subB"],
+        synthesizer=lambda q, v: "FINAL", keep=True)
+    assert summary["type"] == "done"
+    assert summary["trace_id"] is None              # no tracer → no trace id
+    assert seen_ctx[0] is None and seen_ctx[1] is None  # workers get no context

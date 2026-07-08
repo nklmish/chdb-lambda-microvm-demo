@@ -169,6 +169,7 @@ def test_pg_config_defaults(monkeypatch):
     for k in ("POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_DB",
               "POSTGRES_USER", "POSTGRES_PASSWORD"):
         monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(cs, "_pg_from_ssm", lambda: None)   # hermetic: no AWS
     cfg = cs.pg_config()
     assert cfg["host"] == "localhost" and cfg["port"] == "5432"
     assert cfg["db"] == "nyctaxi" and cfg["table"] == "taxi_zones"
@@ -177,8 +178,33 @@ def test_pg_config_defaults(monkeypatch):
 def test_pg_config_env_override(monkeypatch):
     monkeypatch.setenv("POSTGRES_HOST", "pghost")
     monkeypatch.setenv("POSTGRES_PORT", "55432")
+    # A non-localhost env host wins outright — SSM must NOT be consulted.
+    monkeypatch.setattr(cs, "_pg_from_ssm", lambda: (_ for _ in ()).throw(AssertionError("SSM consulted")))
     assert cs.pg_config()["host"] == "pghost"
     assert cs.pg_config()["port"] == "55432"
+
+
+def test_pg_config_falls_back_to_ssm_when_host_absent(monkeypatch):
+    for k in ("POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_DB",
+              "POSTGRES_USER", "POSTGRES_PASSWORD"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(cs, "_pg_from_ssm", lambda: {
+        "host": "aurora.cluster-xyz.us-west-2.rds.amazonaws.com",
+        "port": "5432", "db": "nyctaxi", "user": "taxi_ro", "password": "s3cret"})
+    cfg = cs.pg_config()
+    assert cfg["host"].startswith("aurora.cluster-")
+    assert cfg["user"] == "taxi_ro" and cfg["password"] == "s3cret"
+    assert cfg["table"] == "taxi_zones"
+
+
+def test_pg_config_localhost_env_still_tries_ssm(monkeypatch):
+    # compose sets POSTGRES_HOST=postgres (used directly); but a bare localhost /
+    # unset means "no explicit PG" → SSM (cloud Aurora) is preferred when present.
+    monkeypatch.setenv("POSTGRES_HOST", "localhost")
+    monkeypatch.setattr(cs, "_pg_from_ssm", lambda: {
+        "host": "aurora.x.rds.amazonaws.com", "port": "5432",
+        "db": "nyctaxi", "user": "taxi_ro", "password": "pw"})
+    assert cs.pg_config()["host"] == "aurora.x.rds.amazonaws.com"
 
 
 def test_build_zone_sql_federates_to_postgresql(monkeypatch):

@@ -77,6 +77,13 @@
             padding: 14px 18px; margin: 0 0 18px; line-height: 1.5; font-size: 14px;
             white-space: pre-wrap;
         }
+        .tracelink {
+            display: none; font-size: 13px; font-weight: 600; color: var(--accent);
+            text-decoration: none; padding: 5px 12px; border-radius: 999px;
+            background: color-mix(in srgb, var(--accent) 12%, transparent);
+        }
+        .tracelink.show { display: inline-flex; }
+        .tracelink:hover { text-decoration: underline; }
         .synthesis.show { display: block; }
         .synthesis .lbl { font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 8px; display: block; }
         .grid {
@@ -158,6 +165,7 @@
         <div class="headline" id="headline">
             <span class="big" id="wall"></span>
             <span class="badge" id="badge"></span>
+            <a id="traceLink" class="tracelink" href="#" target="_blank" rel="noopener">View trace in Langfuse ↗</a>
             <span style="color:var(--muted);font-size:13px">Each MicroVM answered a different sub-question against its own private chDB.</span>
         </div>
 
@@ -218,7 +226,10 @@
         }
 
         function handleEvent(d) {
-            if (d.type === 'preflight') {
+            if (d.type === 'prewarm') {
+                if (d.status === 'start') $('phase').textContent = 'warming federation database (Aurora resuming from $0)…';
+                else if (d.status === 'timeout') $('phase').textContent = 'federation DB still warming — the zone worker may fall back…';
+            } else if (d.type === 'preflight') {
                 const plural = d.n === 1 ? 'agent' : 'agents';
                 $('phase').textContent = `decomposed into ${d.n} sub-question(s) — launching ${d.n} ${plural} from ${d.region} image v${d.version} …`;
             } else if (d.type === 'launch') {
@@ -251,8 +262,14 @@
             } else if (d.type === 'done') {
                 $('wall').textContent = `${d.ok}/${d.total} agents answered in ${d.wall_ms} ms wall-clock`;
                 $('badge').textContent = `⛓ ${d.total}-way decomposition`;
+                if (d.trace_url) {
+                    const a = $('traceLink');
+                    a.href = d.trace_url;
+                    a.classList.add('show');
+                }
                 $('headline').classList.add('show');
-                $('phase').textContent = `${d.ok}/${d.total} answered · synthesized into one briefing.`;
+                const sess = d.session_id ? ` · Langfuse session ${d.session_id}` : '';
+                $('phase').textContent = `${d.ok}/${d.total} answered · synthesized into one briefing${sess}.`;
             } else if (d.type === 'terminated') {
                 $('phase').textContent += `  fleet terminated (${d.ids.length} MicroVMs).`;
             } else if (d.type === 'error') {
@@ -266,6 +283,7 @@
             Object.keys(cards).forEach(k => delete cards[k]);
             $('grid').innerHTML = '';
             $('headline').classList.remove('show');
+            $('traceLink').classList.remove('show');
             $('synthesis').classList.remove('show');
             $('synthText').textContent = '';
             $('errBox').classList.remove('show');

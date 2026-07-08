@@ -29,16 +29,66 @@ import os
 import signal
 import sys
 import threading
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import fleet_core as fc  # noqa: E402
+import fleet_tracing as ft  # noqa: E402
 import uvicorn  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse  # noqa: E402
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _AGENTIC_HTML = os.path.join(_ROOT, "static", "agentic.html")
+
+
+def _resolve_egress_connectors(region: str) -> list[str] | None:
+    """Best-effort SSM lookup of the VPC egress connector the agentic fleet uses to
+    reach the private Aurora zone lookup over native TCP. None when the federation
+    stack isn't deployed — the fleet then runs on default public egress (and the
+    zone-tipping tool degrades gracefully, as before)."""
+    try:
+        import boto3
+
+        ssm = boto3.client("ssm", region_name=region)
+        arn = ssm.get_parameter(
+            Name="/federation/EGRESS_CONNECTOR_ARN")["Parameter"]["Value"].strip()
+        return [arn] if arn else None
+    except Exception:  # noqa: BLE001 — no connector / no perms → public egress
+        return None
+
+
+def _prewarm_aurora(region: str, emit) -> None:
+    """Wake the auto-paused Aurora (min 0 ACU) before the zone-tipping worker hits
+    it over native TCP, so the first federated JOIN doesn't time out on cold-start.
+
+    Fires a Data API SELECT (HTTPS — no VPC needed) and waits until the cluster
+    responds. Best-effort: silently skips when the federation stack isn't deployed.
+    Emits {"type":"prewarm","status": start|done|timeout} so the page can show it.
+    """
+    try:
+        import boto3
+
+        ssm = boto3.client("ssm", region_name=region)
+        cluster = ssm.get_parameter(
+            Name="/federation/AURORA_CLUSTER_ARN")["Parameter"]["Value"]
+        secret = ssm.get_parameter(
+            Name="/federation/AURORA_SECRET_ARN")["Parameter"]["Value"]
+        rds = boto3.client("rds-data", region_name=region)
+    except Exception:  # noqa: BLE001 — no federation stack → nothing to warm
+        return
+    emit({"type": "prewarm", "status": "start"})
+    deadline = time.time() + 100
+    while time.time() < deadline:
+        try:
+            rds.execute_statement(resourceArn=cluster, secretArn=secret,
+                                  database="nyctaxi", sql="SELECT 1")
+            emit({"type": "prewarm", "status": "done"})
+            return
+        except Exception:  # noqa: BLE001 — DatabaseResuming/Unavailable → retry
+            time.sleep(6)
+    emit({"type": "prewarm", "status": "timeout"})
 
 # Crash-safety registry: ids launched by a *non-keep* run, terminated on exit if
 # the run didn't finish cleanly (e.g. the server was killed mid-fan-out).
@@ -91,6 +141,14 @@ def build_app(default_region: str, default_name: str,
               model_id: str = fc.DEFAULT_COORDINATOR_MODEL) -> FastAPI:
     app = FastAPI()
 
+    # Build the Langfuse tracer once (SSM creds + auth check). None → untraced,
+    # and the fan-out runs exactly as before. The demo never hard-depends on it.
+    tracer = ft.build_fleet_tracer()
+    if tracer:
+        print("Langfuse tracing ON — the fan-out stitches into one distributed trace")
+    else:
+        print("Langfuse tracing OFF (no /langfuse/* creds or SDK) — running untraced")
+
     @app.get("/")
     async def index() -> FileResponse:
         return FileResponse(_AGENTIC_HTML)
@@ -102,6 +160,7 @@ def build_app(default_region: str, default_name: str,
             "defaultName": default_name,
             "maxFleet": fc.MAX_FLEET,
             "question": fc.AGENTIC_DEFAULT_QUESTION,
+            "tracing": tracer is not None,
         })
 
     @app.get("/run")
@@ -117,6 +176,10 @@ def build_app(default_region: str, default_name: str,
         # LLM; the default question uses the curated, always-green plan.
         planner = fc.bedrock_planner(region, model_id)
         synthesizer = fc.bedrock_synthesizer(region, model_id)
+        # Route the agentic workers through the VPC egress connector (when the
+        # federation stack is deployed) so their zone-tipping tool can reach the
+        # private Aurora over native TCP.
+        egress_connectors = _resolve_egress_connectors(region)
 
         # Refuse a second concurrent run rather than launch another fleet.
         if not _run_gate.acquire(blocking=False):
@@ -135,13 +198,22 @@ def build_app(default_region: str, default_name: str,
                 _register([v["id"] for v in ev["vms"]], region)
             if ev.get("type") == "terminated":
                 _drop(ev.get("ids", []))
+            # Enrich the terminal event with a clickable Langfuse trace URL.
+            if ev.get("type") == "done" and ev.get("trace_id"):
+                ev = {**ev, "trace_url": ft.trace_url(ev["trace_id"])}
             loop.call_soon_threadsafe(queue.put_nowait, ev)
 
         def worker() -> None:
             try:
+                # When federating to the private Aurora, wake it first so the
+                # zone-tipping worker's first native-TCP JOIN doesn't hit a
+                # cold (auto-paused) cluster and time out.
+                if egress_connectors:
+                    _prewarm_aurora(region, emit)
                 fc.run_agentic_fleet_blocking(
                     q, region, name, count=n, on_event=emit, keep=keep,
-                    planner=planner, synthesizer=synthesizer)
+                    planner=planner, synthesizer=synthesizer, tracer=tracer,
+                    egress_connectors=egress_connectors)
             finally:
                 _run_gate.release()
                 loop.call_soon_threadsafe(queue.put_nowait, {"type": "_end"})

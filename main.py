@@ -46,7 +46,7 @@ from db import query_records
 from memory import AnalyticalMemory
 from agent_memory import DualMemory
 from agent import chat_with_agent, stream_chat_with_agent, run_agent_with_tracing
-from observability import init_tracing
+from observability import init_tracing, session_scope
 from timing import init_timing
 
 
@@ -68,6 +68,12 @@ logger = logging.getLogger(__name__)
 
 class ChatRequest(BaseModel):
     text: str = Field(..., max_length=10000)
+    # Langfuse session grouping: the fleet coordinator passes one session_id per
+    # run so every worker's trace lands grouped in the Sessions view. trace_name
+    # gives the worker's trace a descriptive name instead of "POST /chat".
+    session_id: Optional[str] = None
+    user_id: Optional[str] = None
+    trace_name: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -92,6 +98,9 @@ class InvocationRequest(BaseModel):
     # Use 'parent_span_id' — never 'parent_observation_id' (v2/v3 key, silently ignored by v4).
     trace_id: Optional[str] = None
     parent_span_id: Optional[str] = None
+    session_id: Optional[str] = None
+    user_id: Optional[str] = None
+    trace_name: Optional[str] = None
 
 
 # --- Per-request memory builder ---------------------------------------------
@@ -227,7 +236,8 @@ async def health() -> JSONResponse:
 async def chat(request: Request, body: ChatRequest) -> ChatResponse:
     init_timing()
     memory = _build_memory(request)
-    result = chat_with_agent(body.text, memory)
+    with session_scope(body.session_id, body.user_id, body.trace_name):
+        result = chat_with_agent(body.text, memory)
     return ChatResponse(
         response=result["response"],
         request_id=getattr(request.state, "request_id", str(uuid.uuid4())),
@@ -306,11 +316,12 @@ async def invocations(request: Request, body: InvocationRequest) -> ChatResponse
 
     env = os.getenv("LANGFUSE_TRACING_ENVIRONMENT", "PRD")
     if env in ("DEV", "TST") and body.trace_id:
-        response_text = run_agent_with_tracing(
-            user_input,
-            trace_id=body.trace_id,
-            parent_span_id=body.parent_span_id,
-        )
+        with session_scope(body.session_id, body.user_id, body.trace_name):
+            response_text = run_agent_with_tracing(
+                user_input,
+                trace_id=body.trace_id,
+                parent_span_id=body.parent_span_id,
+            )
         return ChatResponse(
             response=response_text,
             request_id=getattr(request.state, "request_id", str(uuid.uuid4())),
@@ -318,7 +329,8 @@ async def invocations(request: Request, body: InvocationRequest) -> ChatResponse
         )
 
     memory = _build_memory(request, default_user="agentcore")
-    result = chat_with_agent(user_input, memory)
+    with session_scope(body.session_id, body.user_id, body.trace_name):
+        result = chat_with_agent(user_input, memory)
     return ChatResponse(
         response=result["response"],
         request_id=getattr(request.state, "request_id", str(uuid.uuid4())),

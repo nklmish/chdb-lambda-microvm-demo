@@ -237,7 +237,8 @@
                 if (cons.agree) { badge.className = 'badge agree'; badge.textContent = `✓ ${cons.answered}/${d.total} agree`; }
                 else { badge.className = 'badge diverge'; badge.textContent = `⚠ diverged — ${JSON.stringify(cons.groups)}`; }
                 $('headline').classList.add('show');
-                $('phase').textContent = `${d.ok}/${d.total} answered.`;
+                const sess = d.session_id ? `  Langfuse session ${d.session_id} groups all ${d.total} worker traces.` : '';
+                $('phase').textContent = `${d.ok}/${d.total} answered.${sess}`;
             } else if (d.type === 'terminated') {
                 $('phase').textContent += `  fleet terminated (${d.ids.length} MicroVMs).`;
             } else if (d.type === 'error') {

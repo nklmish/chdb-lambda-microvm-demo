@@ -212,17 +212,73 @@ def chc_credentials() -> dict | None:
 # -- PostgreSQL (third-party RDBMS leg — taxi-zone lookup) ---------------------
 
 # The zone-enrichment leg (paper's Fig 3 + hero-SQL `postgresql()`). Defaults
-# match compose.yml's postgres service; override via POSTGRES_* for other hosts.
+# match compose.yml's postgres service; override via POSTGRES_* for other hosts,
+# or resolve from SSM /postgres/* for the cloud Aurora leg (mirrors /clickhouse/*).
 _PG_TABLE = "taxi_zones"
+_pg_ssm_cache: dict | None = None
+_pg_ssm_lock = threading.Lock()
+_PG_SSM_PREFIX = "/postgres"
+
+
+def _pg_from_ssm() -> dict | None:
+    """Resolve the Aurora Postgres leg from SSM /postgres/* (cached).
+
+    HOST/PORT/DB/USER are plain String params; PASSWORD is a SecureString. The SSM
+    region is POSTGRES_SSM_REGION (params live in us-east-1 with /clickhouse/* and
+    /langfuse/*, while the MicroVM runs in us-west-2). Best-effort: any failure
+    returns None so pg_config falls back to the compose defaults.
+    """
+    global _pg_ssm_cache
+    with _pg_ssm_lock:
+        if _pg_ssm_cache is not None:
+            return _pg_ssm_cache
+        region = (
+            os.getenv("POSTGRES_SSM_REGION")
+            or os.getenv("AWS_REGION")
+            or os.getenv("AWS_DEFAULT_REGION")
+            or "us-east-1"
+        )
+        try:
+            import boto3
+
+            ssm = boto3.client("ssm", region_name=region)
+
+            def _param(name: str, *, decrypt: bool = False) -> str:
+                resp = ssm.get_parameter(
+                    Name=f"{_PG_SSM_PREFIX}/{name}", WithDecryption=decrypt)
+                return (resp["Parameter"]["Value"] or "").strip()
+
+            host = _param("POSTGRES_HOST")
+            pwd = _param("POSTGRES_PASSWORD", decrypt=True)
+            cfg = {
+                "host": host,
+                "port": _param("POSTGRES_PORT") or "5432",
+                "db": _param("POSTGRES_DB") or "nyctaxi",
+                "user": _param("POSTGRES_USER") or "taxi",
+                "password": pwd,
+            }
+        except Exception:  # noqa: BLE001 — SSM unavailable → compose defaults
+            return None
+        if not cfg["host"] or not cfg["password"]:
+            return None
+        _pg_ssm_cache = cfg
+        return _pg_ssm_cache
 
 
 def pg_config() -> dict:
-    """Resolve PostgreSQL connection details (defaults match compose.yml).
+    """Resolve PostgreSQL connection details.
 
-    Always returns a config — the leg degrades gracefully at query time if the
-    server is unreachable (the federation tool catches and annotates), so no
-    presence check is needed here.
+    Prefers explicit POSTGRES_* env (compose sets POSTGRES_HOST=postgres); when the
+    host is unset/localhost, falls back to SSM /postgres/* so a deployed MicroVM —
+    with only its exec role, no baked secrets — federates to the cloud Aurora zone
+    lookup. Always returns a config; the leg degrades gracefully at query time if
+    the server is unreachable (the tool catches and annotates).
     """
+    env_host = os.getenv("POSTGRES_HOST", "").strip()
+    if not env_host or env_host in ("localhost", "127.0.0.1"):
+        resolved = _pg_from_ssm()
+        if resolved is not None:
+            return {**resolved, "table": _PG_TABLE}
     return {
         "host": os.getenv("POSTGRES_HOST", "localhost"),
         "port": os.getenv("POSTGRES_PORT", "5432"),

@@ -9,6 +9,7 @@ from stacks.s3_files_stack import S3FilesStack
 from stacks.monitoring_stack import MonitoringStack
 from stacks.cicd_stack import CicdStack
 from stacks.mount_demo_stack import MountDemoStack
+from stacks.federation_stack import FederationStack
 
 app = cdk.App()
 # Account/region come from the deploying credentials (CDK_DEFAULT_*), so this
@@ -37,5 +38,17 @@ mount_demo = MountDemoStack(app, "NycTaxiMountDemo", vpc=network.vpc,
                             ecr_repo=ecr.repository, env=env)
 mount_demo.add_dependency(s3_files)
 mount_demo.add_dependency(ecr)
+
+# Zone-tipping federation leg: private Aurora Serverless v2 in the MicroVM fleet's
+# region (us-west-2), reached over native TCP via a Lambda MicroVMs egress
+# connector. Pinned to us-west-2 regardless of the default region above, since the
+# fleet — and therefore the connector — is regional there.
+federation = FederationStack(
+    app, "NycTaxiFederation",
+    env=cdk.Environment(
+        account=os.getenv("CDK_DEFAULT_ACCOUNT"),
+        region=os.getenv("FEDERATION_REGION", "us-west-2"),
+    ),
+)
 
 app.synth()

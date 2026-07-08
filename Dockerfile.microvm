@@ -45,4 +45,7 @@ EXPOSE 8080 9000
 HEALTHCHECK --interval=30s --timeout=5s CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"
 # opentelemetry-instrument wraps the process to keep OTEL auto-instrumentation;
 # microvm_entrypoint.py runs the app (:8080) + hooks (:9000) on one event loop.
+# Langfuse trace export is configured at runtime by the run/resume lifecycle hook
+# (observability.configure_langfuse_runtime), under the execution role — because
+# the snapshot/resume model runs this CMD at build time under the build role.
 CMD ["opentelemetry-instrument", "python", "microvm_entrypoint.py"]

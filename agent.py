@@ -288,8 +288,9 @@ async def stream_chat_with_agent(
     memory.save_conversation("user", user_input)
     memory.save_conversation("assistant", response_text)
 
-    langfuse_host = os.environ.get("LANGFUSE_HOST", "").rstrip("/")
-    trace_url = f"{langfuse_host}/trace/{trace_id}" if (trace_id and langfuse_host) else None
+    from observability import trace_url as build_trace_url
+
+    trace_url = build_trace_url(trace_id)
 
     yield {
         "type": "done",
@@ -319,9 +320,28 @@ def run_agent_with_tracing(
     NOT the deprecated "parent_observation_id".
     """
     env = os.getenv("LANGFUSE_TRACING_ENVIRONMENT", "PRD")
+    traced = env in ("DEV", "TST") and bool(trace_id)
+
+    # On a MicroVM the run/resume hook configures Langfuse export; ensure it's up
+    # (idempotent; returns False and no-ops off a MicroVM / without the flag).
+    runtime_configured = False
+    if traced:
+        try:
+            from observability import configure_langfuse_runtime
+            runtime_configured = configure_langfuse_runtime()
+        except Exception:  # noqa: BLE001 — telemetry must never break the agent
+            runtime_configured = False
+
     agent = create_agent()
 
-    if env in ("DEV", "TST") and trace_id:
+    if traced and runtime_configured:
+        # MicroVM worker: link via explicit OTEL remote-parent context so the
+        # agent's spans nest under the coordinator's fan-out trace, exported by the
+        # single OTLP processor configure_langfuse_runtime attached. No Langfuse SDK
+        # here → exactly one export path, no duplicate spans.
+        response = _run_agent_otel_linked(agent, user_input, trace_id, parent_span_id)
+    elif traced:
+        # AgentCore DEV/TST: the proven Langfuse-SDK linking path.
         with get_client().start_as_current_observation(
             name="strands-agent",
             as_type="span",
@@ -335,3 +355,37 @@ def run_agent_with_tracing(
         response = agent(user_input)
 
     return response.message["content"][0]["text"]
+
+
+def _run_agent_otel_linked(agent, user_input: str, trace_id: str,
+                           parent_span_id: str | None):
+    """Run the agent under an OTEL span parented to a REMOTE (coordinator) span.
+
+    Builds a non-recording remote SpanContext from the caller's hex trace_id /
+    parent_span_id and attaches it, so the agent's spans join that trace and nest
+    under the coordinator's agent-i span. Falls back to a plain run if the ids are
+    malformed — tracing must never break the answer.
+    """
+    from opentelemetry import context as _c
+    from opentelemetry import trace as _t
+    from opentelemetry.trace import (
+        NonRecordingSpan, SpanContext, TraceFlags, set_span_in_context,
+    )
+
+    try:
+        tid = int(trace_id, 16)
+        sid = int(parent_span_id, 16) if parent_span_id else 0
+    except (TypeError, ValueError):
+        return agent(user_input)
+
+    parent_ctx = set_span_in_context(NonRecordingSpan(SpanContext(
+        trace_id=tid, span_id=sid, is_remote=True,
+        trace_flags=TraceFlags(TraceFlags.SAMPLED),
+    )))
+    token = _c.attach(parent_ctx)
+    try:
+        tracer = _t.get_tracer("nyc-taxi-agent")
+        with tracer.start_as_current_span("strands-agent"):
+            return agent(user_input)
+    finally:
+        _c.detach(token)

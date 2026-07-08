@@ -276,6 +276,22 @@ python scripts/chdb_memory_demo.py
   live, with a safe fallback to fanning the raw question if planning fails. Same tested core
   ([`fleet_core.py`](fleet_core.py)), server-side orchestration (auth tokens never reach the
   browser), and guaranteed teardown as the consensus console.
+
+  When Langfuse creds are present (`/langfuse/*` in SSM), the whole fan-out stitches into a
+  **single distributed trace** — a coordinator root with `plan` / `agent-i` / `synthesis`
+  children, each worker's own MicroVM agent spans nesting in via remote W3C trace-context, all
+  grouped under one Langfuse Session. See the cookbook:
+  [docs/langfuse-distributed-tracing.md](docs/langfuse-distributed-tracing.md).
+  ![Langfuse: one distributed trace for the agentic fan-out — agentic-fanout root over plan / agent-0..3 / synthesis, grouped in a Session with tags](docs/screenshots/langfuse_trace.png)
+
+  *One real run:* the coordinator (`agentic-fanout`) fans four sub-questions across four MicroVMs
+  and folds the answers into one briefing — **51.6 s, $0.24, 4 agents**, grouped under Session
+  `agentic-briefing-…` with `distributed-trace` / `microvm-fleet` tags. Expand a worker and its
+  own agent trace is right there: `agent-1` → `strands-agent` → Bedrock `chat` +
+  `analyze_zone_tipping` → the private-Aurora cred resolution (`SSM.GetParameter`), returning the
+  federated zone-tipping answer (LaGuardia, 20.94%) tagged with the exact `microvm_id` that
+  produced it.
+  ![Langfuse: expanding agent-1 reveals its MicroVM worker trace — Bedrock chat plus analyze_zone_tipping federating to private Aurora via SSM.GetParameter](docs/screenshots/langfuse_trace_worker.png)
 - **Zero-refactor graduation to ClickHouse Cloud** — the *same* analytical SQL served from a
   local chDB table, then from ClickHouse Cloud via `remoteSecure()` — only the view's source
   changes:

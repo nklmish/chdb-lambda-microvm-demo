@@ -56,6 +56,12 @@ BEDROCK_REGIONS = ("us-east-1", "us-east-2", "us-west-2")
 # so nothing secret is baked into the image. Override with CLICKHOUSE_SSM_REGION.
 CLICKHOUSE_SSM_REGION = os.getenv("CLICKHOUSE_SSM_REGION", "us-east-1")
 
+# Region holding the Langfuse Cloud credential params (/langfuse/*). The MicroVM
+# resolves these from SSM at boot to configure OTLP trace export to Langfuse — no
+# secret is baked into the image (mirrors the ClickHouse pattern). Override with
+# LANGFUSE_SSM_REGION.
+LANGFUSE_SSM_REGION = os.getenv("LANGFUSE_SSM_REGION", "us-east-1")
+
 # Files/dirs never shipped in the build artifact: secrets, local data, scratch,
 # build outputs, and anything irrelevant to the runtime image.
 EXCLUDE_DIRS = {
@@ -251,6 +257,51 @@ def _exec_role_policy(account: str, region: str) -> str:
                     },
                 },
                 {
+                    # Observability: read Langfuse Cloud creds from SSM /langfuse/*
+                    # at boot to configure OTLP trace export (least-privilege; no
+                    # baked secrets). Harmless when the params don't exist — the
+                    # boot cred-resolve is best-effort and just leaves tracing off.
+                    "Sid": "ReadLangfuseCreds",
+                    "Effect": "Allow",
+                    "Action": ["ssm:GetParameter", "ssm:GetParameters"],
+                    "Resource": (
+                        f"arn:aws:ssm:{LANGFUSE_SSM_REGION}:{account}:parameter/langfuse/*"
+                    ),
+                },
+                {
+                    "Sid": "DecryptLangfuseSecret",
+                    "Effect": "Allow",
+                    "Action": ["kms:Decrypt"],
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "kms:ViaService": f"ssm.{LANGFUSE_SSM_REGION}.amazonaws.com"
+                        }
+                    },
+                },
+                {
+                    # Zone-tipping federation: read the Aurora Postgres app creds
+                    # from SSM /postgres/* (in THIS region — same as the fleet) at
+                    # runtime. Harmless when absent (the leg degrades gracefully).
+                    "Sid": "ReadPostgresCreds",
+                    "Effect": "Allow",
+                    "Action": ["ssm:GetParameter", "ssm:GetParameters"],
+                    "Resource": (
+                        f"arn:aws:ssm:{region}:{account}:parameter/postgres/*"
+                    ),
+                },
+                {
+                    "Sid": "DecryptPostgresSecret",
+                    "Effect": "Allow",
+                    "Action": ["kms:Decrypt"],
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "kms:ViaService": f"ssm.{region}.amazonaws.com"
+                        }
+                    },
+                },
+                {
                     # Distributed-scan cold lake: read the private yellow-taxi
                     # parquet the MicroVM's chDB s3() scans. Least-privilege —
                     # scoped to this account's artifact bucket's lake/ prefix.
@@ -415,8 +466,13 @@ def _hooks_config() -> str:
                 "validateTimeoutInSeconds": 120,
             },
             "microvmHooks": {
-                "run": "ENABLED", "runTimeoutInSeconds": 5,
-                "resume": "ENABLED", "resumeTimeoutInSeconds": 5,
+                # run/resume fire post-snapshot-resume, in-process, under the exec
+                # role — where observability.configure_langfuse_runtime resolves
+                # /langfuse/* from SSM and attaches the OTLP exporter. 30s gives the
+                # cross-region SSM lookups headroom (setup is also idempotently
+                # retried on the first traced request as a backstop).
+                "run": "ENABLED", "runTimeoutInSeconds": 30,
+                "resume": "ENABLED", "resumeTimeoutInSeconds": 30,
                 "suspend": "ENABLED", "suspendTimeoutInSeconds": 10,
                 "terminate": "ENABLED", "terminateTimeoutInSeconds": 10,
             },
@@ -431,11 +487,17 @@ def _image_arn(name: str, account: str, region: str) -> str:
 def _env_vars(region: str, account: str) -> str:
     """Baked-in runtime env — no secrets (no Langfuse creds, no ClickHouse creds).
 
-    Bedrock region must match where model access is enabled; tracing exporters are
-    off so the agent needs no Langfuse credentials. The execution-role creds reach
-    the guest via IMDSv2, so no AWS keys are baked in. The ClickHouse Cloud
-    federation leg resolves its creds from SSM /clickhouse/* at runtime (via the
-    exec role), so only the SSM *region* is passed here — never the credentials.
+    Bedrock region must match where model access is enabled. The execution-role
+    creds reach the guest via IMDSv2, so no AWS keys are baked in. Both the
+    ClickHouse federation leg and Langfuse tracing resolve their creds from SSM at
+    runtime (via the exec role), so only the SSM *regions* are passed here — never
+    the credentials.
+
+    Observability: OTEL_TRACES_EXPORTER stays "none" as the safe default;
+    microvm_boot.py flips it to "otlp" only after it successfully resolves
+    /langfuse/* from SSM (LANGFUSE_RESOLVE_FROM_SSM=true). LANGFUSE_TRACING_ENVIRONMENT
+    is DEV so /invocations links each worker into the coordinator's fan-out trace
+    (run_agent_with_tracing); a failed resolve just boots untraced.
     """
     # NB: AWS_REGION / AWS_DEFAULT_REGION are RESERVED keys (rejected by
     # create-microvm-image). The region the guest's IMDS reports is used by the
@@ -451,10 +513,18 @@ def _env_vars(region: str, account: str) -> str:
             # Where the federation warehouse leg looks up ClickHouse Cloud creds
             # (SSM /clickhouse/*) — may differ from the compute region.
             "CLICKHOUSE_SSM_REGION": CLICKHOUSE_SSM_REGION,
+            # The Aurora zone-lookup creds (/postgres/*) live in the fleet's own
+            # region (published by scripts/setup_federation.py).
+            "POSTGRES_SSM_REGION": region,
             # Distributed-scan cold lake (private S3, read via the exec role).
             "LAKE_BUCKET": f"nyc-taxi-microvm-artifacts-{account}-{region}",
             "LAKE_PREFIX": "lake/yellow",
-            "OTEL_TRACES_EXPORTER": "none",
+            # Observability → Langfuse Cloud. Creds resolved from SSM at boot by
+            # microvm_boot.py (mirrors the /clickhouse/* pattern); no secret baked.
+            "LANGFUSE_RESOLVE_FROM_SSM": "true",
+            "LANGFUSE_SSM_REGION": LANGFUSE_SSM_REGION,
+            "LANGFUSE_TRACING_ENVIRONMENT": "DEV",
+            "OTEL_TRACES_EXPORTER": "none",   # microvm_boot flips to "otlp" on resolve
             "OTEL_METRICS_EXPORTER": "none",
             "DISABLE_ADOT_OBSERVABILITY": "true",
         }
