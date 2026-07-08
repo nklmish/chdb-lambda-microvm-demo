@@ -21,6 +21,13 @@ agentic-fanout                 root observation (coordinator)
 …and the whole tree — coordinator spans *and* the remote worker spans — is grouped under one
 Langfuse **Session**, so a fleet run reads as a single entry in the Sessions view.
 
+![Langfuse trace of one agentic fan-out run: agentic-fanout root over plan / agent-0..3 / synthesis, grouped in a Session with tags, showing the synthesized briefing](screenshots/langfuse_trace.png)
+
+*A real run (2026-07-08):* one `agentic-fanout` trace — **51.6 s, $0.24, 4 workers** — grouped
+under Session `agentic-briefing-e5a85415139f` with `agentic-fanout` / `microvm-fleet` /
+`distributed-trace` / `region:us-west-2` tags and user `fleet-console`. The root's output is the
+synthesized briefing; each `agent-i` carries its worker's sub-question and answer.
+
 Three ingredients make it work. Each degrades to a no-op when Langfuse is absent — the fan-out
 runs identically untraced, so the demo never hard-depends on observability.
 
@@ -77,6 +84,18 @@ finally:
 ```
 
 Malformed ids fall back to a plain run — the answer still comes back, just unlinked.
+
+Expand a worker in that same trace and its entire on-MicroVM agent run is nested underneath —
+proof the link works across the process boundary:
+
+![Expanding agent-1: its MicroVM worker trace nests in — strands-agent → invoke_agent → execute_event_loop_cycle → Bedrock chat + analyze_zone_tipping federating to private Aurora via five SSM.GetParameter spans; the detail panel shows the federated answer and the microvm_id that produced it](screenshots/langfuse_trace_worker.png)
+
+Here `agent-1`'s worker fans down to `strands-agent → invoke_agent → execute_event_loop_cycle →`
+Bedrock `chat` **and** `analyze_zone_tipping` (28.6 s) → five `SSM.GetParameter` spans — the
+private-Aurora credential resolution for the federated zone-tipping JOIN over TCP. The detail
+panel carries the federated answer (LaGuardia, 20.94%) and the `microvm_id` of the exact VM that
+produced it. None of these spans came from the coordinator; they were emitted on the MicroVM and
+linked in via the remote parent above.
 
 **One export path, no duplicates.** The worker links via *explicit OTEL remote-parent context*,
 **not** the Langfuse SDK. A single `BatchSpanProcessor` on the global tracer provider is the only
